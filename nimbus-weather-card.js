@@ -1,4 +1,4 @@
-// Nimbus Weather Card v2.1.0
+// Nimbus Weather Card v2.2.0
 // https://github.com/maxfok/nimbus-weather-card
 // (c) 2024 Gerasimos Fokaefs — MIT License
 
@@ -127,12 +127,10 @@ const MDI = {
     <circle cx="32" cy="32" r="2" fill="rgba(255,255,255,0.6)"/>
   </svg>`,
   thermometer: `<svg viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
-    <rect x="28" y="10" width="8" height="30" rx="4" fill="rgba(255,255,255,0.15)" stroke="rgba(255,255,255,0.35)" stroke-width="1.2"/>
-    <rect x="30" y="20" width="4" height="20" rx="2" fill="rgba(255,160,120,0.7)"/>
-    <circle cx="32" cy="46" r="8" fill="rgba(255,130,100,0.6)" stroke="rgba(255,255,255,0.35)" stroke-width="1.2"/>
-    <line x1="36" y1="20" x2="40" y2="20" stroke="rgba(255,255,255,0.35)" stroke-width="1.2" stroke-linecap="round"/>
-    <line x1="36" y1="27" x2="40" y2="27" stroke="rgba(255,255,255,0.35)" stroke-width="1.2" stroke-linecap="round"/>
-    <line x1="36" y1="34" x2="40" y2="34" stroke="rgba(255,255,255,0.35)" stroke-width="1.2" stroke-linecap="round"/>
+    <path d="M32 10a4 4 0 0 0-4 4v24a8 8 0 1 0 8 0V14a4 4 0 0 0-4-4z" fill="rgba(255,255,255,0.1)" stroke="rgba(255,255,255,0.45)" stroke-width="1.5"/>
+    <line x1="38" y1="20" x2="42" y2="20" stroke="rgba(255,255,255,0.45)" stroke-width="1.5" stroke-linecap="round"/>
+    <line x1="38" y1="28" x2="42" y2="28" stroke="rgba(255,255,255,0.45)" stroke-width="1.5" stroke-linecap="round"/>
+    <line x1="38" y1="36" x2="42" y2="36" stroke="rgba(255,255,255,0.45)" stroke-width="1.5" stroke-linecap="round"/>
   </svg>`,
 };
 
@@ -257,6 +255,8 @@ function getMoonSVGLarge(phase) {
 
 function getIcon(condition, isNight, moonPhase) {
   if (condition === 'partlycloudy' && isNight) return MDI['partlycloudy-night'];
+  // If condition is 'clear-night' but it's actually daytime → show sun instead of moon
+  if (condition === 'clear-night' && !isNight) return MDI['sunny'] || MDI['exceptional'];
   if (condition === 'clear-night' || (condition === 'sunny' && isNight)) {
     return moonPhase ? getMoonSVG(moonPhase) : MDI['clear-night'];
   }
@@ -286,6 +286,14 @@ const BOLT_PATHS = [
   'M48,0 L52,32 L44,36 L56,70 L47,74 L55,100',
 ];
 
+
+// v2: color interpolation helper for granular sky gradients
+function _lerpColor(a, b, t) {
+  const hr = h => [parseInt(h.slice(1,3),16), parseInt(h.slice(3,5),16), parseInt(h.slice(5,7),16)];
+  const [ar,ag,ab] = hr(a), [br,bg,bb] = hr(b);
+  return `rgb(${Math.round(ar+(br-ar)*t)},${Math.round(ag+(bg-ag)*t)},${Math.round(ab+(bb-ab)*t)})`;
+}
+
 class NimbusWeatherCard extends HTMLElement {
   static getStubConfig(hass) {
     const entity = hass ? Object.keys(hass.states).find(e => e.startsWith('weather.')) || 'weather.home' : 'weather.home';
@@ -297,8 +305,15 @@ class NimbusWeatherCard extends HTMLElement {
     super();
     this.attachShadow({ mode: 'open' });
     this._forecast = [];
+    this._dailyForecast = [];   // always daily — used for hi/lo display
+    this._modalForecast = [];
     this._lastEntity = null;
     this._forecastUnsub = null;
+    this._dailyForecastUnsub = null;
+    this._modalForecastUnsub = null;
+    this._subscribedEntity = null;
+    this._subscribedForecastType = null;
+    this._subscribedModalForecastType = null;
     this._lastParticleKey = null;
     this._initialized = false;
     this._lxInterval = null;
@@ -358,6 +373,7 @@ class NimbusWeatherCard extends HTMLElement {
       local_sensors: config.local_sensors || [],
       ufo_easter_egg: config.ufo_easter_egg !== false,
       latitude_zone: config.latitude_zone || 'northern_temperate',
+      tap_action: config.tap_action || null,
     };
   }
 
@@ -443,37 +459,95 @@ class NimbusWeatherCard extends HTMLElement {
     if (this._clockInterval) { clearInterval(this._clockInterval); this._clockInterval = null; }
     if (this._rafId)        { cancelAnimationFrame(this._rafId);  this._rafId        = null; }
     if (this._ufoTimer)     { clearTimeout(this._ufoTimer);       this._ufoTimer     = null; }
-    if (this._forecastUnsub) { this._forecastUnsub(); this._forecastUnsub = null; }
+    this._unsubscribeForecasts();
     this._ufoActive = false;
   }
 
-  _moonPhase() {
-    if (this._config.moon_entity && this._hass.states[this._config.moon_entity]) {
-      // Normalize: "New moon" → "new_moon", "Waxing crescent" → "waxing_crescent" κλπ
-      const raw = this._hass.states[this._config.moon_entity].state;
-      return raw.toLowerCase().replace(/\s+/g, '_');
+_moonPhase() {
+  // 1. Αν ορίστηκε custom moon_entity
+  if (this._config.moon_entity && this._hass.states[this._config.moon_entity]) {
+    const raw = this._hass.states[this._config.moon_entity].state;
+    return raw.toLowerCase().replace(/\s+/g, '_');
+  }
+  // 2. Αν υπάρχει το τυπικό sensor.moon_phase
+  const moonSensor = this._hass?.states['sensor.moon_phase'];
+  if (moonSensor) {
+    const phase = moonSensor.state.toLowerCase();
+    const map = {
+      'new moon': 'new_moon',
+      'waxing crescent': 'waxing_crescent',
+      'first quarter': 'first_quarter',
+      'waxing gibbous': 'waxing_gibbous',
+      'full moon': 'full_moon',
+      'waning gibbous': 'waning_gibbous',
+      'last quarter': 'last_quarter',
+      'waning crescent': 'waning_crescent'
+    };
+    for (const [key, val] of Object.entries(map)) {
+      if (phase.includes(key)) return val;
     }
-    // Calculate moon phase from date when no sensor
-    const date = new Date();
-    const year = date.getFullYear(), month = date.getMonth() + 1, day = date.getDate();
-    let y = year, m = month;
+    return phase.replace(/\s+/g, '_');
+  }
+  // 3. Υπολογισμός από ημερομηνία (fallback)
+  const date = new Date();
+  const year = date.getFullYear(), month = date.getMonth() + 1, day = date.getDate();
+  let y = year, m = month;
+  if (m < 3) { y--; m += 12; }
+  const a = Math.floor(y / 100);
+  const b = 2 - a + Math.floor(a / 4);
+  const jd = Math.floor(365.25 * (y + 4716)) + Math.floor(30.6001 * (m + 1)) + day + b - 1524.5;
+  const phase = ((jd - 2451550.1) / 29.530588853) % 1;
+  const p = phase < 0 ? phase + 1 : phase;
+  if (p < 0.033) return 'new_moon';
+  if (p < 0.216) return 'waxing_crescent';
+  if (p < 0.283) return 'first_quarter';
+  if (p < 0.466) return 'waxing_gibbous';
+  if (p < 0.533) return 'full_moon';
+  if (p < 0.716) return 'waning_gibbous';
+  if (p < 0.783) return 'last_quarter';
+  if (p < 0.966) return 'waning_crescent';
+  return 'new_moon';
+}
+
+  _moonPhaseFractionFromDate(date = new Date()) {
+    const year = date.getFullYear();
+    const month = date.getMonth() + 1;
+    const day = date.getDate();
+    let y = year;
+    let m = month;
     if (m < 3) { y--; m += 12; }
     const a = Math.floor(y / 100);
     const b = 2 - a + Math.floor(a / 4);
-    const jd = Math.floor(365.25 * (y + 4716)) + Math.floor(30.6001 * (m + 1)) + day + b - 1524.5;
+    const utcDayFraction = (
+      date.getUTCHours() +
+      date.getUTCMinutes() / 60 +
+      date.getUTCSeconds() / 3600 +
+      date.getUTCMilliseconds() / 3600000
+    ) / 24;
+    const jd = Math.floor(365.25 * (y + 4716)) + Math.floor(30.6001 * (m + 1)) + day + utcDayFraction + b - 1524.5;
     const phase = ((jd - 2451550.1) / 29.530588853) % 1;
-    const p = phase < 0 ? phase + 1 : phase;
-    if (p < 0.033) return 'new_moon';
-    if (p < 0.216) return 'waxing_crescent';
-    if (p < 0.283) return 'first_quarter';
-    if (p < 0.466) return 'waxing_gibbous';
-    if (p < 0.533) return 'full_moon';
-    if (p < 0.716) return 'waning_gibbous';
-    if (p < 0.783) return 'last_quarter';
-    if (p < 0.966) return 'waning_crescent';
-    return 'new_moon';
+    return phase < 0 ? phase + 1 : phase;
   }
 
+  _moonPhaseFraction() {
+    const phase = this._moonPhase();
+    const phaseMap = {
+      'new_moon': 0,
+      'waxing_crescent': 0.125,
+      'first_quarter': 0.25,
+      'waxing_gibbous': 0.375,
+      'full_moon': 0.5,
+      'waning_gibbous': 0.625,
+      'last_quarter': 0.75,
+      'waning_crescent': 0.875,
+    };
+
+    if (this._config.moon_entity && this._hass.states[this._config.moon_entity]) {
+      return phaseMap[phase] ?? this._moonPhaseFractionFromDate();
+    }
+
+    return this._moonPhaseFractionFromDate();
+  }
 
   // Moon position calculation based on time and latitude
   _moonPosition() {
@@ -613,24 +687,77 @@ class NimbusWeatherCard extends HTMLElement {
   }
 
   _elevationBg(condition, isNight) {
+    // v2: 7 sun-elevation sky phases for all conditions
     if (isNight) return null;
     if (!['sunny','partlycloudy','windy','windy-variant'].includes(condition)) return null;
 
-    const el  = Math.max(-10, Math.min(90, this._sunElevation()));
-
-    // Fixed position — top right
+    const el = Math.max(-30, Math.min(90, this._sunElevation()));
     const xPct = 82, yPct = 12;
 
-    if (el < -5)
-      return 'linear-gradient(170deg,#080c1a 0%,#0e1628 100%)';
+    // Astronomical night (< -18): deep sky
+    if (el < -18) {
+      return `linear-gradient(180deg,#020818 0%,#050f28 55%,#09142e 100%)`;
+    }
 
-    if (el < 5)
-      return `radial-gradient(circle 130px at ${xPct}% ${yPct}%,rgba(255,255,200,1) 0%,rgba(255,180,40,0.92) 8%,rgba(255,80,20,0.75) 20%,rgba(140,60,100,0.80) 45%,rgba(30,20,60,1) 100%)`;
+    // Nautical dawn/dusk (-18 to -6): very deep blue lifting toward horizon
+    if (el < -6) {
+      const t = (el + 18) / 12; // 0->1
+      return `linear-gradient(175deg,${_lerpColor('#020818','#071428',t)} 0%,${_lerpColor('#050f28','#0d1f45',t)} 55%,${_lerpColor('#09142e','#162040',t)} 100%)`;
+    }
 
-    if (el < 20)
-      return `radial-gradient(circle 130px at ${xPct}% ${yPct}%,rgba(255,255,220,1) 0%,rgba(255,230,100,0.92) 8%,rgba(255,180,60,0.70) 20%,rgba(140,190,240,0.85) 45%,rgba(50,110,200,1) 100%)`;
+    // Civil / blue hour (-6 to -0.5): deep indigo-blue with hint of violet
+    if (el < -0.5) {
+      const t = (el + 6) / 5.5; // 0→1
+      const top   = _lerpColor('#071428','#0a1a38',t);
+      const mid   = _lerpColor('#0e1e40','#1a2a60',t);
+      const bot   = _lerpColor('#1a2248','#3a2870',t);
+      return `linear-gradient(175deg,${top} 0%,${mid} 40%,${bot} 100%)`;
+    }
 
-    return `radial-gradient(circle 130px at ${xPct}% ${yPct}%,rgba(255,255,255,1) 0%,rgba(255,255,180,0.92) 8%,rgba(200,230,255,0.85) 25%,rgba(80,170,240,0.92) 55%,rgba(30,120,210,1) 100%)`;
+    // Sun spot helpers — v2.1.0 radial gradient at sun position
+    const sunSunrise = `radial-gradient(circle 130px at ${xPct}% ${yPct}%,rgba(255,255,200,1) 0%,rgba(255,180,40,0.92) 8%,rgba(255,80,20,0.75) 20%,rgba(140,60,100,0.55) 45%,transparent 70%)`;
+    const sunGolden  = `radial-gradient(circle 130px at ${xPct}% ${yPct}%,rgba(255,255,210,1) 0%,rgba(255,210,80,0.92) 8%,rgba(255,180,60,0.65) 20%,rgba(180,170,140,0.40) 45%,transparent 70%)`;
+    const sunMorning = `radial-gradient(circle 130px at ${xPct}% ${yPct}%,rgba(255,255,220,1) 0%,rgba(255,230,100,0.92) 8%,rgba(255,180,60,0.55) 20%,rgba(140,190,240,0.30) 45%,transparent 70%)`;
+    const sunDay     = `radial-gradient(circle 130px at ${xPct}% ${yPct}%,rgba(255,255,250,1) 0%,rgba(255,250,200,0.85) 8%,rgba(220,235,255,0.55) 22%,rgba(150,200,240,0.25) 50%,transparent 75%)`;
+    const sunMidday  = `radial-gradient(circle 130px at ${xPct}% ${yPct}%,rgba(255,255,255,1) 0%,rgba(255,255,210,0.90) 8%,rgba(220,240,255,0.55) 22%,rgba(140,200,240,0.20) 50%,transparent 75%)`;
+
+    // Sunrise / Sunset (-0.5° to 5°): fiery red-orange horizon, deep blue top
+    if (el < 5) {
+      const t = (el + 0.5) / 5.5;
+      const sky = `linear-gradient(175deg,${_lerpColor('#1a2845','#0a1835',t)} 0%,${_lerpColor('#c75020','#162a5a',t)} 35%,${_lerpColor('#f08030','#2a3d70',t)} 65%,${_lerpColor('#e06828','#2a3d70',t)} 100%)`;
+      return `${sunSunrise},${sky}`;
+    }
+
+    // Golden hour (5° to 12°): warm sky, sun rising, still warm horizon
+    if (el < 12) {
+      const t = (el - 5) / 7;
+      const sky = `linear-gradient(175deg,${_lerpColor('#1a3868','#1a5090',t)} 0%,${_lerpColor('#cd5824','#d46828',t)} 30%,${_lerpColor('#689ad8','#6090d0',t)} 65%,${_lerpColor('#4378b0','#4a80c0',t)} 100%)`;
+      return `${sunGolden},${sky}`;
+    }
+
+    // Early morning / late afternoon (12° to 20°): soft warm to clear blue
+    if (el < 20) {
+      const t = (el - 12) / 8;
+      const sky = `linear-gradient(175deg,${_lerpColor('#1a5090','#1a68b0',t)} 0%,${_lerpColor('#d46828','#9090c0',t)} 30%,${_lerpColor('#6090d0','#5ba0d8',t)} 65%,${_lerpColor('#4a80c0','#80b8e0',t)} 100%)`;
+      return `${sunMorning},${sky}`;
+    }
+
+    // Morning (20° to 35°): clear blue with soft horizon
+    if (el < 35) {
+      const t = (el - 20) / 15;
+      const sky = `linear-gradient(180deg,${_lerpColor('#1868b8','#1476d0',t)} 0%,${_lerpColor('#2a90d8','#2a90d8',t)} 40%,${_lerpColor('#5ab0e8','#5ab0e8',t)} 75%,${_lerpColor('#80c8f0','#88c8f5',t)} 100%)`;
+      return `${sunMorning},${sky}`;
+    }
+
+    // Full day (35° to 55°): clean blue
+    if (el < 55) {
+      const t = (el - 35) / 20;
+      const sky = `linear-gradient(180deg,${_lerpColor('#1476d0','#1070cc',t)} 0%,${_lerpColor('#2a90d8','#1888e8',t)} 30%,${_lerpColor('#5ab0e8','#28a0f0',t)} 60%,${_lerpColor('#88c8f5','#60c0ff',t)} 100%)`;
+      return `${sunDay},${sky}`;
+    }
+
+    // Bright midday (>55°): bright clear sky, brilliant sun
+    return `${sunMidday},linear-gradient(180deg,#1070cc 0%,#1888e8 25%,#28a0f0 55%,#60c0ff 100%)`;
   }
 
   // Ελέγχει αν έβρεξε τις τελευταίες 2 ώρες βάσει ιστορικού
@@ -736,52 +863,21 @@ class NimbusWeatherCard extends HTMLElement {
     }
 
     const phase = this._moonPhase();
+    const phaseFraction = this._moonPhaseFraction();
     const size  = 60; // px
 
-    // Phase shadows via box-shadow
-    // Southern hemisphere: waxing/waning are mirrored
-    const southernZones = ['southern_temperate', 'antarctic'];
-    const isSouthern = southernZones.includes(this._config.latitude_zone);
-    const SHADOWS_N = {
-      'new_moon':        `inset 0 0 0 ${size/2}px rgba(4,7,18,0.98)`,
-      'waxing_crescent': `inset ${size*0.4}px 0px ${size*0.3}px ${size*0.2}px rgba(4,7,18,0.97)`,
-      'first_quarter':   `inset ${size*0.45}px 0px ${size*0.2}px 0px rgba(4,7,18,0.97)`,
-      'waxing_gibbous':  `inset ${size*0.15}px 0px ${size*0.2}px -${size*0.05}px rgba(4,7,18,0.95)`,
-      'full_moon':       `inset -${size*0.08}px ${size*0.08}px ${size*0.06}px -${size*0.05}px rgba(255,248,200,0.18), inset ${size*0.15}px -${size*0.15}px ${size*0.35}px ${size*0.25}px rgba(0,0,0,0.78)`,
-      'waning_gibbous':  `inset -${size*0.15}px 0px ${size*0.2}px -${size*0.05}px rgba(4,7,18,0.95)`,
-      'last_quarter':    `inset -${size*0.45}px 0px ${size*0.2}px 0px rgba(4,7,18,0.97)`,
-      'waning_crescent': `inset -${size*0.4}px 0px ${size*0.3}px ${size*0.2}px rgba(4,7,18,0.97)`,
-    };
-    const SHADOWS_S = {
-      'new_moon':        `inset 0 0 0 ${size/2}px rgba(4,7,18,0.98)`,
-      'waxing_crescent': `inset -${size*0.4}px 0px ${size*0.3}px ${size*0.2}px rgba(4,7,18,0.97)`,
-      'first_quarter':   `inset -${size*0.45}px 0px ${size*0.2}px 0px rgba(4,7,18,0.97)`,
-      'waxing_gibbous':  `inset -${size*0.15}px 0px ${size*0.2}px -${size*0.05}px rgba(4,7,18,0.95)`,
-      'full_moon':       `inset -${size*0.08}px ${size*0.08}px ${size*0.06}px -${size*0.05}px rgba(255,248,200,0.18), inset ${size*0.15}px -${size*0.15}px ${size*0.35}px ${size*0.25}px rgba(0,0,0,0.78)`,
-      'waning_gibbous':  `inset ${size*0.15}px 0px ${size*0.2}px -${size*0.05}px rgba(4,7,18,0.95)`,
-      'last_quarter':    `inset ${size*0.45}px 0px ${size*0.2}px 0px rgba(4,7,18,0.97)`,
-      'waning_crescent': `inset ${size*0.4}px 0px ${size*0.3}px ${size*0.2}px rgba(4,7,18,0.97)`,
-    };
-    const SHADOWS = isSouthern ? SHADOWS_S : SHADOWS_N;
-
     const moonOpacity = {
-      'clear-night':0.95,'partlycloudy':0.55,'cloudy':0.15,
-      'windy':0.70,'windy-variant':0.70,'snowy':0.30,'fog':0.05,
+      'clear-night':0.95,'partlycloudy':0.65,'cloudy':0.34,
+      'windy':0.70,'windy-variant':0.70,'rainy':0.42,'pouring':0.34,
+      'lightning-rainy':0.38,'snowy':0.36,'fog':0.08,
     }[condition] ?? 0.85;
-
-    const cardRect = this.shadowRoot.querySelector('.card')?.getBoundingClientRect();
-    const W = cardRect?.width  || 300;
-    const H = cardRect?.height || 200;
 
     moonDiv.style.width    = `${size}px`;
     moonDiv.style.height   = `${size}px`;
-    const moonPos  = this._moonPosition();
-    const moonEl   = moonPos.elevation;
-    const moonAz   = moonPos.azimuth;
     // Fixed position top right
-    moonDiv.style.left     = `calc(82% - ${size/2}px)`;
-    moonDiv.style.top      = `calc(12% - ${size/2}px)`;
-    moonDiv.style.right    = '';
+    moonDiv.style.left     = '';
+    moonDiv.style.top      = '24px';
+    moonDiv.style.right    = '24px';
     // Hide moon when sun is above horizon
     const sunEl = this._sunElevation();
     const finalMoonOpacity = sunEl > 2 ? 0 : moonOpacity;
@@ -799,7 +895,7 @@ class NimbusWeatherCard extends HTMLElement {
     const moonRotWrap = moonDiv.querySelector('#moon-rot-wrapper');
     if (moonRotWrap) moonRotWrap.style.transform = `rotate(${moonRotDeg}deg)`;
     // Εφαρμόζω shadow μόνο αν άλλαξε φάση
-    const moonKey = `${condition}-${phase}`;
+    const moonKey = `${condition}-${phase}-${phaseFraction.toFixed(3)}`;
     if (moonDiv._lastKey !== moonKey) {
       moonDiv.style.boxShadow = `0 0 ${size*0.5}px ${size*0.15}px rgba(240,220,140,0.14)`;
 
@@ -817,7 +913,7 @@ class NimbusWeatherCard extends HTMLElement {
       const oc = overlay.getContext('2d');
       oc.scale(dpr, dpr);
       oc.clearRect(0, 0, size*2, size*2);
-      this._drawMoonPhaseOverlay(oc, size, phase);
+      this._drawMoonPhaseOverlay(oc, size, phase, phaseFraction);
       moonDiv._lastKey = moonKey;
     }
   }
@@ -911,60 +1007,62 @@ class NimbusWeatherCard extends HTMLElement {
     }
   }
 
-  _drawMoonPhaseOverlay(ctx, size, phase) {
+  _drawMoonPhaseOverlay(ctx, size, phase, phaseFraction = null) {
     const r  = size;
     const cx = size;
     const cy = size;
 
-    if (phase === 'full_moon') return;
+    const phaseMap = {
+      'new_moon': 0,
+      'waxing_crescent': 0.125,
+      'first_quarter': 0.25,
+      'waxing_gibbous': 0.375,
+      'full_moon': 0.5,
+      'waning_gibbous': 0.625,
+      'last_quarter': 0.75,
+      'waning_crescent': 0.875,
+    };
+    const p = ((phaseFraction ?? phaseMap[phase] ?? 0.5) % 1 + 1) % 1;
+    const isSouthern = ['southern_temperate', 'antarctic'].includes(this._config.latitude_zone);
+    const visualP = isSouthern ? (1 - p) % 1 : p;
+    const illumination = (1 - Math.cos(2 * Math.PI * p)) / 2;
 
     ctx.save();
-    // Clip εντός κύκλου
     ctx.beginPath();
-    ctx.arc(cx, cy, r, 0, Math.PI*2);
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
     ctx.clip();
-    ctx.fillStyle = 'rgb(4,7,18)';
+    ctx.fillStyle = 'rgba(4,7,18,0.96)';
+    ctx.fillRect(0, 0, size * 2, size * 2);
 
-    if (phase === 'new_moon') {
-      ctx.fillRect(0, 0, size*2, size*2);
+    if (illumination < 0.015) {
       ctx.restore();
       return;
     }
 
-    // Ίδιο path με _moonLitPath — σχεδιάζω το φωτεινό τμήμα
-    // και ό,τι δεν καλύπτεται παραμένει με texture
-    // Στρατηγική: σκοτεινό = full circle MINUS φωτεινό path
-    const offMap = {
-      'waxing_crescent': 0.60,
-      'first_quarter':   0.22,
-      'waxing_gibbous': -0.22,
-      'waning_gibbous': -0.22,
-      'last_quarter':    0.22,
-      'waning_crescent': 0.60,
-    };
-    const off      = (offMap[phase] ?? 0) * r;
-    const tx       = Math.abs(off);
-    const isWaxing = ['waxing_crescent','first_quarter','waxing_gibbous'].includes(phase);
-    const sweep    = isWaxing ? (off > 0 ? 0 : 1) : (off > 0 ? 1 : 0);
+    ctx.globalCompositeOperation = 'destination-out';
+    ctx.beginPath();
 
-    // Φωτεινό path (ίδιο με SVG forecast)
-    const litPath = new Path2D(
-      isWaxing
-        ? `M${cx},${cy-r} A${r},${r} 0 0,1 ${cx},${cy+r} A${tx},${r} 0 0,${sweep} ${cx},${cy-r} Z`
-        : `M${cx},${cy-r} A${r},${r} 0 0,0 ${cx},${cy+r} A${tx},${r} 0 0,${sweep} ${cx},${cy-r} Z`
-    );
+    if (illumination > 0.9995) {
+      ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    } else {
+      const terminator = Math.cos(2 * Math.PI * visualP);
+      const tx = Math.min(Math.abs(terminator), 0.94) * r;
+      const isWaxing = visualP < 0.5;
+      const sweep = isWaxing
+        ? (terminator > 0 ? 0 : 1)
+        : (terminator > 0 ? 1 : 0);
 
-    // Σκοτεινό = full circle clip minus lit area
-    // Χρησιμοποιώ evenodd: full circle + lit path = σκοτεινό τμήμα
-    const darkPath = new Path2D();
-    darkPath.arc(cx, cy, r, 0, Math.PI*2);
-    // Subpath: το φωτεινό τμήμα (αντίθετη κατεύθυνση)
-    const litPathStr = isWaxing
-      ? `M${cx},${cy-r} A${r},${r} 0 0,1 ${cx},${cy+r} A${tx},${r} 0 0,${sweep} ${cx},${cy-r} Z`
-      : `M${cx},${cy-r} A${r},${r} 0 0,0 ${cx},${cy+r} A${tx},${r} 0 0,${sweep} ${cx},${cy-r} Z`;
-    darkPath.addPath(new Path2D(litPathStr));
+      ctx.moveTo(cx, cy - r);
+      ctx.arc(cx, cy, r, -Math.PI / 2, Math.PI / 2, !isWaxing);
+      if (tx < 0.75) {
+        ctx.lineTo(cx, cy - r);
+      } else {
+        ctx.ellipse(cx, cy, tx, r, 0, Math.PI / 2, -Math.PI / 2, sweep === 0);
+      }
+    }
 
-    ctx.fill(darkPath, 'evenodd');
+    ctx.closePath();
+    ctx.fill();
     ctx.restore();
   }
 
@@ -1026,6 +1124,7 @@ class NimbusWeatherCard extends HTMLElement {
       canvas.height = Math.round(rect.height * dpr);
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       this._stars = null; // reset stars on resize
+      this._cloudKey = null; // mobile layout can settle after first paint
     }
 
     const W = rect.width;
@@ -1078,7 +1177,7 @@ class NimbusWeatherCard extends HTMLElement {
     // fx-canvas χωρίς filter πάντα
     if (this._fxCanvas) this._fxCanvas.style.filter = 'none';
 
-    const isCloud = ['cloudy','overcast','partlycloudy','windy','windy-variant','lightning','lightning-rainy','exceptional'].includes(c);
+    const isCloud = ['cloudy','overcast','partlycloudy','windy','windy-variant','lightning','lightning-rainy','exceptional','rainy','pouring','snowy-rainy'].includes(c);
     if (isCloud)  this._drawClouds(ctx, W, H, t, c, isNight);
     if (isRain)   this._drawRain(ctx, W, H, t, c, attrs);
     if (isSnow)   this._drawSnow(ctx, W, H, t);
@@ -1095,10 +1194,21 @@ class NimbusWeatherCard extends HTMLElement {
         this._dpCtx.setTransform(dpr,0,0,dpr,0,0);
       }
       this._dpCtx.clearRect(0,0,W,H);
-      if (isDrop) this._drawDroplets(this._dpCtx, W, H, t);
+      if (isDrop) {
+        this._drawDroplets(this._dpCtx, W, H, t);
+      } else {
+        this._clearDroplets();
+      }
     }
+
   }
 
+_clearDroplets() {
+  const card = this.shadowRoot.querySelector('.card');
+  if (card) {
+    card.querySelectorAll('.nimbus-drop, .nimbus-drop-b').forEach(el => el.remove());
+  }
+}
 
 
   _drawClouds(ctx, W, H, t, condition, isNight) {
@@ -1110,7 +1220,7 @@ class NimbusWeatherCard extends HTMLElement {
     const card = this.shadowRoot.querySelector('.card');
     if (!card) return;
 
-    const key = `${condition}-${isNight}-${Math.round(W)}`;
+    const key = `${condition}-${isNight}-${Math.round(W)}-${Math.round(H)}`;
     if (this._cloudKey === key) return;
     this._cloudKey = key;
 
@@ -1223,8 +1333,26 @@ class NimbusWeatherCard extends HTMLElement {
     if (!clouds || clouds.length === 0) return;
 
     const bgColor = isNight ? '#0d1428' : '#4a7ab5';
+    const isCoarsePointer = window.matchMedia?.('(hover: none) and (pointer: coarse)')?.matches;
+    const isMobileUA = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent || '');
+    const isWetCloud = ['rainy','pouring','lightning','lightning-rainy','snowy-rainy'].includes(condition);
+    const useMobileCloudPaint = isCoarsePointer || isMobileUA;
+    const mobileTone = {
+      'partlycloudy':       { rgb:'248,252,255', alpha:1.10, opacity:0.92, blur:0.85 },
+      'cloudy':             { rgb:sc,            alpha:1.00, opacity:1.00, blur:1.00 },
+      'overcast':           { rgb:'118,132,148', alpha:0.68, opacity:0.58, blur:1.28 },
+      'rainy':              { rgb:'148,170,192', alpha:1.06, opacity:0.88, blur:1.18 },
+      'pouring':            { rgb:'132,154,176', alpha:1.12, opacity:0.90, blur:1.24 },
+      'lightning':          { rgb:'144,150,190', alpha:1.00, opacity:0.82, blur:1.18 },
+      'lightning-rainy':    { rgb:'138,150,186', alpha:1.06, opacity:0.86, blur:1.22 },
+      'snowy':              { rgb:'220,232,242', alpha:0.64, opacity:0.54, blur:1.06 },
+      'snowy-rainy':        { rgb:'200,218,232', alpha:0.92, opacity:0.76, blur:1.12 },
+      'windy':              { rgb:'210,228,242', alpha:1.35, opacity:0.95, blur:0.90 },
+      'windy-variant':      { rgb:'210,228,242', alpha:1.35, opacity:0.95, blur:0.90 },
+      'exceptional':        { rgb:'170,180,200', alpha:0.50, opacity:0.42, blur:1.00 },
+    }[condition] || { rgb:sc, alpha:0.72, opacity:0.62, blur:1.00 };
 
-    clouds.forEach(c => {
+    clouds.forEach((c, idx) => {
       const cw = W * c.w;
       const ch = H * c.h;
       const tx = W * c.cx;
@@ -1235,6 +1363,42 @@ class NimbusWeatherCard extends HTMLElement {
       const shadowY = ty - HIDE_Y;
 
       const d = document.createElement('div');
+      if (useMobileCloudPaint) {
+        const sheetW = Math.min(W * 1.08, Math.max(cw * 1.55, W * 0.48));
+        const sheetH = Math.min(H * 0.26, Math.max(ch * 0.85, H * 0.10));
+        const sheetX = tx - sheetW / 2;
+        const sheetY = ty - sheetH / 2 + (idx % 2 ? -sheetH * 0.08 : sheetH * 0.06);
+        const a1 = Math.min(isWetCloud ? 0.46 : 0.62, c.sa * (isWetCloud ? 0.52 : 0.68) * mobileTone.alpha).toFixed(3);
+        const a2 = Math.min(isWetCloud ? 0.34 : 0.48, c.sa * (isWetCloud ? 0.38 : 0.52) * mobileTone.alpha).toFixed(3);
+        const a3 = Math.min(isWetCloud ? 0.25 : 0.34, c.sa * (isWetCloud ? 0.28 : 0.38) * mobileTone.alpha).toFixed(3);
+        const a4 = Math.min(isWetCloud ? 0.16 : 0.22, c.sa * (isWetCloud ? 0.18 : 0.26) * mobileTone.alpha).toFixed(3);
+        const hi = Math.min(isWetCloud ? 0.14 : 0.18, c.sa * (isWetCloud ? 0.14 : 0.20) * mobileTone.alpha).toFixed(3);
+        const blur = Math.max(12, Math.min(24, c.sb * 0.22 * mobileTone.blur)).toFixed(1);
+        const opacity = Math.min(isWetCloud ? 0.78 : 0.92, c.op * (isWetCloud ? 0.92 : 0.95) * mobileTone.opacity).toFixed(2);
+        const brightness = isWetCloud ? ' brightness(1.08)' : '';
+        const duration = 46 + idx * 9;
+        const delay = -(idx * 8);
+        d.className = 'nimbus-cloud-div nimbus-cloud-mobile';
+        d.style.cssText = `
+          position:absolute;
+          width:${sheetW}px; height:${sheetH}px;
+          left:${sheetX}px; top:${sheetY}px;
+          border-radius:999px;
+          background:
+            linear-gradient(90deg, transparent 0%, rgba(${mobileTone.rgb},${a4}) 10%, rgba(${mobileTone.rgb},${a2}) 34%, rgba(${mobileTone.rgb},${a1}) 52%, rgba(${mobileTone.rgb},${a3}) 78%, transparent 100%),
+            radial-gradient(ellipse 92% 74% at 48% 52%, rgba(${mobileTone.rgb},${a1}) 0%, rgba(${mobileTone.rgb},${a2}) 42%, rgba(${mobileTone.rgb},${a4}) 64%, transparent 82%),
+            radial-gradient(ellipse 38% 42% at 72% 35%, rgba(245,250,255,${hi}) 0%, transparent 66%);
+          filter:blur(${blur}px) saturate(1.03)${brightness};
+          opacity:${opacity};
+          pointer-events:none;
+          z-index:2;
+          animation:nimbusMobileCloudDrift ${duration}s ease-in-out ${delay}s infinite alternate;
+          will-change:transform;
+        `;
+        card.appendChild(d);
+        return;
+      }
+
       d.className = 'nimbus-cloud-div';
       d.style.cssText = `
         position:absolute;
@@ -1938,13 +2102,72 @@ class NimbusWeatherCard extends HTMLElement {
     });
   }
 
-  _subscribeForecast(entityId) {
+  _modalForecastType() {
+    return this._config?.forecast_type === 'hourly' ? 'daily' : 'hourly';
+  }
+
+  _forecastTitle(type) {
+    return type === 'hourly' ? 'Hourly Forecast' : '7-Day Forecast';
+  }
+
+  _forecastButtonLabel(type) {
+    return type === 'hourly' ? 'Hourly' : '7-day';
+  }
+
+  _modalForecastLimit(type) {
+    return type === 'hourly' ? 24 : 7;
+  }
+
+  _unsubscribeForecasts() {
     if (this._forecastUnsub) { this._forecastUnsub(); this._forecastUnsub = null; }
+    if (this._dailyForecastUnsub) { this._dailyForecastUnsub(); this._dailyForecastUnsub = null; }
+    if (this._modalForecastUnsub) { this._modalForecastUnsub(); this._modalForecastUnsub = null; }
+    this._subscribedEntity = null;
+    this._subscribedForecastType = null;
+    this._subscribedModalForecastType = null;
+  }
+
+  _subscribeForecast(entityId) {
+    this._unsubscribeForecasts();
     if (!this._hass?.connection) return;
+    const mainType = this._config.forecast_type || 'daily';
+    const modalType = this._modalForecastType();
+    this._forecast = [];
+    this._dailyForecast = [];
+    this._modalForecast = [];
+    this._subscribedEntity = entityId;
+    this._subscribedForecastType = mainType;
+    this._subscribedModalForecastType = modalType;
+
     this._hass.connection.subscribeMessage(
-      msg => { this._forecast = msg.forecast || []; this._renderContent(); },
-      { type: 'weather/subscribe_forecast', forecast_type: this._config.forecast_type, entity_id: entityId }
-    ).then(u => { if (typeof u === 'function') this._forecastUnsub = u; }).catch(() => { this._forecast = []; });
+      msg => {
+        if (this._subscribedEntity !== entityId || this._subscribedForecastType !== mainType) return;
+        this._forecast = msg.forecast || [];
+        this._renderContent();
+      },
+      { type: 'weather/subscribe_forecast', forecast_type: mainType, entity_id: entityId }
+    ).then(u => { if (typeof u === 'function') this._forecastUnsub = u; }).catch(() => { this._forecast = []; this._renderContent(); });
+
+    // Always subscribe to daily forecast for hi/lo display (even when main is hourly)
+    if (mainType !== 'daily') {
+      this._hass.connection.subscribeMessage(
+        msg => {
+          if (this._subscribedEntity !== entityId) return;
+          this._dailyForecast = msg.forecast || [];
+          this._renderContent();
+        },
+        { type: 'weather/subscribe_forecast', forecast_type: 'daily', entity_id: entityId }
+      ).then(u => { if (typeof u === 'function') this._dailyForecastUnsub = u; }).catch(() => { this._dailyForecast = []; });
+    }
+
+    this._hass.connection.subscribeMessage(
+      msg => {
+        if (this._subscribedEntity !== entityId || this._subscribedModalForecastType !== modalType) return;
+        this._modalForecast = msg.forecast || [];
+        this._renderContent();
+      },
+      { type: 'weather/subscribe_forecast', forecast_type: modalType, entity_id: entityId }
+    ).then(u => { if (typeof u === 'function') this._modalForecastUnsub = u; }).catch(() => { this._modalForecast = []; this._renderContent(); });
   }
 
   async _render() {
@@ -1959,6 +2182,17 @@ class NimbusWeatherCard extends HTMLElement {
     if (!this._initialized) {
       this._buildShell();
       this._initialized = true;
+    }
+    const stateExists = !!this._hass.states[id];
+    const forecastType = this._config.forecast_type || 'daily';
+    const modalForecastType = this._modalForecastType();
+    if (!stateExists) {
+      this._unsubscribeForecasts();
+    } else if (
+      this._subscribedEntity !== id ||
+      this._subscribedForecastType !== forecastType ||
+      this._subscribedModalForecastType !== modalForecastType
+    ) {
       this._subscribeForecast(id);
     }
     this._renderContent();
@@ -1998,6 +2232,10 @@ class NimbusWeatherCard extends HTMLElement {
 
 /* ── CONTENT ── */
 .ct { position:relative; z-index:4; padding:18px; color:#fff; text-shadow:0 2px 4px rgba(0,0,0,0.35), 0 0 8px rgba(0,0,0,0.2) }
+.entity-error { min-height:170px; display:flex; flex-direction:column; justify-content:center; gap:8px; }
+.entity-error-title { font-size:15px; font-weight:700; letter-spacing:.02em; }
+.entity-error-subtitle { font-size:12px; line-height:1.4; opacity:.75; max-width:260px; }
+.entity-error-code { font-size:11px; opacity:.65; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; word-break:break-word; }
 
 /* ── RAIN ── */
 /* far layer — small, slow, faint */
@@ -2197,6 +2435,13 @@ class NimbusWeatherCard extends HTMLElement {
 @keyframes mD3 { 0%{transform:translate3d(-20px,0,0)} 50%{transform:translate3d(45px,12px,0)} 100%{transform:translate3d(-20px,0,0)} }
 @keyframes mD4 { 0%{transform:translate3d(50px,0,0)} 50%{transform:translate3d(-30px,-5px,0)} 100%{transform:translate3d(50px,0,0)} }
 
+/* ── MOBILE CLOUD FALLBACK ── */
+@keyframes nimbusMobileCloudDrift {
+  0%   { transform:translate3d(-28px,2px,0) scale(1); }
+  50%  { transform:translate3d(8px,-6px,0) scale(1.04); }
+  100% { transform:translate3d(36px,3px,0) scale(1.02); }
+}
+
 /* ── WIND STREAKS ── */
 
 
@@ -2243,6 +2488,29 @@ class NimbusWeatherCard extends HTMLElement {
 .det-row-main { display:flex; gap:12px; flex-wrap:wrap; padding:2px 0; }
 .dic  { width:16px; height:16px; flex-shrink:0 }
 .fc   { position:relative; z-index:5; display:flex; gap:0; overflow-x:auto; background:rgba(0,20,60,0.22); backdrop-filter:blur(25px) saturate(200%) brightness(0.9); -webkit-backdrop-filter:blur(25px) saturate(200%) brightness(0.9); border-radius:16px; border:1px solid rgba(255,255,255,0.18); box-shadow:0 2px 8px rgba(0,0,0,0.10) }
+/* v2: expand button */
+.fc-expand-btn { display:flex; align-items:center; justify-content:flex-end; gap:4px; padding:4px 8px 0; cursor:pointer; user-select:none; }
+.fc-expand-btn span { font-size:10px; color:rgba(255,255,255,0.28); letter-spacing:0.07em; text-transform:uppercase; font-weight:500; transition:color 0.15s; }
+.fc-expand-btn svg  { opacity:0.28; transition:opacity 0.15s; }
+.fc-expand-btn:hover span, .fc-expand-btn:hover svg { color:rgba(255,255,255,0.6); opacity:0.6; }
+/* v2: Forecast modal */
+.fc-modal-backdrop { position:absolute; inset:0; z-index:20; background:rgba(0,0,0,0.55); border-radius:24px; backdrop-filter:blur(6px); opacity:0; pointer-events:none; transition:opacity 0.3s; }
+.fc-modal-backdrop.open { opacity:1; pointer-events:none; }
+.fc-modal { position:absolute; left:0; right:0; bottom:0; z-index:21; background:linear-gradient(180deg,rgba(8,18,40,0.97) 0%,rgba(4,10,24,0.99) 100%); border-top:1px solid rgba(255,255,255,0.12); border-radius:20px 20px 24px 24px; padding:0 0 16px; transform:translateY(100%); transition:transform 0.38s cubic-bezier(0.25,0.46,0.45,0.94); max-height:85%; overflow-y:auto; }
+.fc-modal.open { transform:translateY(0); }
+.fc-modal-handle { width:32px; height:3px; border-radius:2px; background:rgba(255,255,255,0.18); margin:10px auto 0; }
+.fc-modal-title { font-size:11px; font-weight:600; letter-spacing:0.08em; color:rgba(255,255,255,0.38); text-transform:uppercase; text-align:center; padding:10px 16px 8px; }
+.fc-modal-row { display:flex; align-items:center; gap:8px; padding:9px 16px; border-bottom:1px solid rgba(255,255,255,0.05); }
+.fc-modal-row:last-child { border-bottom:none; }
+.fc-modal-day  { font-size:12px; color:rgba(255,255,255,0.45); width:36px; }
+.fc-modal-icon { width:22px; height:22px; flex-shrink:0; }
+.fc-modal-lo   { font-size:11px; color:rgba(255,255,255,0.32); width:24px; text-align:right; }
+.fc-modal-hi   { font-size:12px; font-weight:600; width:24px; }
+.fc-modal-temp { font-size:12px; font-weight:600; width:32px; text-align:right; }
+.fc-modal-bar-bg { flex:1; height:4px; border-radius:2px; background:rgba(255,255,255,0.08); overflow:hidden; position:relative; }
+.fc-modal-bar-fill { height:100%; border-radius:2px; background:linear-gradient(90deg,rgba(80,160,240,0.7),rgba(255,180,60,0.85)); }
+.fc-modal-precip { font-size:10px; color:rgba(99,179,237,0.65); width:28px; text-align:right; font-family:monospace; }
+.fc-modal-empty { padding:16px; font-size:12px; color:rgba(255,255,255,0.4); text-align:center; }
 .fc::-webkit-scrollbar { display:none }
 .fi   { flex:1; min-width:52px; display:flex; flex-direction:column; align-items:center; padding:10px 6px }
 .fd  { font-size:13px; font-weight:700; opacity:.85; margin-bottom:5px; letter-spacing:.04em; text-transform:uppercase }
@@ -2324,6 +2592,16 @@ class NimbusWeatherCard extends HTMLElement {
     <div class="bg" id="bg"></div>
     <canvas id="wx-canvas"></canvas>
     <canvas id="fx-canvas"></canvas>
+    <!-- v2: forecast modal — built once in _buildShell, survives re-renders -->
+    <div class="fc-modal-backdrop" id="fc-backdrop"></div>
+    <div class="fc-modal" id="fc-modal">
+      <div class="fc-modal-handle"></div>
+      <div class="fc-modal-header" style="display:flex;align-items:center;justify-content:space-between;padding:10px 16px 8px;">
+        <div class="fc-modal-title" style="padding:0;">7-Day Forecast</div>
+        <div class="fc-modal-close" style="cursor:pointer;font-size:18px;color:rgba(255,255,255,0.35);line-height:1;padding:4px 6px;border-radius:8px;background:rgba(255,255,255,0.06);">✕</div>
+      </div>
+      <div id="fc-modal-rows"></div>
+    </div>
     <div id="ptcl-sunmoon" style="position:absolute;inset:0;pointer-events:none;z-index:2"></div>
     <div id="ptcl-clouds" style="position:absolute;inset:0;pointer-events:none;z-index:3"></div>
     <div id="ptcl-weather" style="position:absolute;inset:0;pointer-events:none;z-index:2"></div>
@@ -2331,11 +2609,30 @@ class NimbusWeatherCard extends HTMLElement {
     <div class="ct" id="ct"></div>
   </div>
 </div>`;
+    this._modalHandlersAttached = false;
     this.shadowRoot.getElementById('card').addEventListener('click', () => {
-      const entity = this._config && this._config.entity;
-      if (!entity) return;
-      const event = new CustomEvent('hass-more-info', { bubbles: true, composed: true, detail: { entityId: entity } });
-      this.dispatchEvent(event);
+      const tapAction = this._config?.tap_action;
+      if (tapAction) {
+        const action = tapAction.action || 'more-info';
+        if (action === 'navigate' && tapAction.navigation_path) {
+          window.history.pushState(null, '', tapAction.navigation_path);
+          window.dispatchEvent(new PopStateEvent('popstate'));
+        } else if (action === 'url' && tapAction.url_path) {
+          window.open(tapAction.url_path, tapAction.url_path.startsWith('http') ? '_blank' : '_self');
+        } else if (action === 'none') {
+          return;
+        } else {
+          // default: more-info
+          const entity = this._config?.entity;
+          if (!entity) return;
+          this.dispatchEvent(new CustomEvent('hass-more-info', { bubbles: true, composed: true, detail: { entityId: entity } }));
+        }
+      } else {
+        // no tap_action defined → more-info (default behaviour)
+        const entity = this._config?.entity;
+        if (!entity) return;
+        this.dispatchEvent(new CustomEvent('hass-more-info', { bubbles: true, composed: true, detail: { entityId: entity } }));
+      }
     });
   }
 
@@ -2368,10 +2665,10 @@ class NimbusWeatherCard extends HTMLElement {
     return Math.round(v);
   }
 
-  _day(str) {
+  _day(str, forecastType = this._config?.forecast_type || 'daily') {
     if (!str) return '--';
     const d = new Date(str);
-    if (this._config.forecast_type === 'hourly') {
+    if (forecastType === 'hourly') {
       if (this._config.use_24h !== false) {
         return d.getHours().toString().padStart(2, '0') + ':00';
       } else {
@@ -2384,10 +2681,45 @@ class NimbusWeatherCard extends HTMLElement {
     return d.toLocaleDateString(loc, { weekday: 'short' }).toUpperCase();
   }
 
+  _renderEntityError(entityId) {
+    const bgEl = this.shadowRoot?.getElementById('bg');
+    if (bgEl) {
+      bgEl.className = 'bg bg-default';
+      bgEl.style.background = '';
+      bgEl.style.transition = '';
+    }
+    ['ptcl-sunmoon', 'ptcl-clouds', 'ptcl-weather'].forEach(id => {
+      const el = this.shadowRoot?.getElementById(id);
+      if (el) el.innerHTML = '';
+    });
+    ['wx-canvas', 'fx-canvas', 'dp-canvas'].forEach(id => {
+      const canvas = this.shadowRoot?.getElementById(id);
+      const ctx = canvas?.getContext?.('2d');
+      if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
+    });
+    if (this._rafId) {
+      cancelAnimationFrame(this._rafId);
+      this._rafId = null;
+    }
+    this._destroyUfo();
+    const ct = this.shadowRoot?.getElementById('ct');
+    if (!ct) return;
+    ct.innerHTML = `
+      <div class="entity-error">
+        <div class="entity-error-title">Weather entity not found</div>
+        <div class="entity-error-subtitle">Select an existing weather entity in the card configuration.</div>
+        <div class="entity-error-code">${this._escapeHtml(entityId || 'No entity configured')}</div>
+      </div>
+    `;
+  }
+
   _renderContent() {
     if (!this._hass || !this._config) return;
     const stateObj = this._hass.states[this._config.entity];
-    if (!stateObj) return;
+    if (!stateObj) {
+      this._renderEntityError(this._config.entity);
+      return;
+    }
 
     const cond    = stateObj.state;
     const attrs   = stateObj.attributes;
@@ -2395,6 +2727,13 @@ class NimbusWeatherCard extends HTMLElement {
     const bgCls   = this._bgClass(cond, isNight);
     const moonPhase = this._moonPhase();
     const forecast = this._forecast.length ? this._forecast : (attrs.forecast || []);
+    const modalForecastType = this._modalForecastType();
+    const modalForecast = this._modalForecast.length ? this._modalForecast : [];
+    // For hi/lo display: always use daily forecast regardless of selected view
+    const mainType = this._config.forecast_type || 'daily';
+    const dailyItems = mainType === 'daily'
+      ? forecast
+      : (this._dailyForecast.length ? this._dailyForecast : (attrs.forecast || []));
     const items   = forecast.slice(0, this._config.max_items);
 
     const bgEl = this.shadowRoot.getElementById('bg');
@@ -2417,7 +2756,7 @@ class NimbusWeatherCard extends HTMLElement {
           <div class="loc">${this._config.name || attrs.friendly_name || ''}</div>
         </div>
         <div class="tmp">${this._t(attrs.temperature)}°</div>
-        <div class="hl"><span class="high">↑${this._t(items[0]?.temperature ?? attrs.temperature)}°</span>  <span class="low">↓${this._t(items[0]?.templow ?? attrs.temperature)}°</span></div>
+        <div class="hl"><span class="high">↑${this._t(dailyItems[0]?.temperature ?? attrs.temperature)}°</span>  <span class="low">↓${this._t(dailyItems[0]?.templow ?? attrs.temperature)}°</span></div>
         <div class="cn2">${this._condLabel(cond)}</div>
         ${(this._config.show_details || this._config.show_clock) ? `
         <div class="det-wrap">
@@ -2433,7 +2772,7 @@ class NimbusWeatherCard extends HTMLElement {
           <div class="splash-layer" id="splash-layer"></div>
         </div>` : ''}
         ${this._config.show_forecast && items.length ? `
-        <div class="fc">
+        <div class="fc" id="fc-strip">
           ${items.map(f => `
             <div class="fi">
               <div class="fd">${this._day(f.datetime)}</div>
@@ -2441,6 +2780,10 @@ class NimbusWeatherCard extends HTMLElement {
               <div class="fh">${this._t(f.temperature)}°</div>
               ${f.templow !== undefined ? `<div class="fl">${this._t(f.templow)}°</div>` : ''}
             </div>`).join('')}
+        </div>
+        <div class="fc-expand-btn" id="fc-expand-btn">
+          <span>${this._forecastButtonLabel(modalForecastType)}</span>
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M3 9L7 5L11 9" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
         </div>` : ''}
         ${!this._config.show_forecast && this._config.local_sensors?.length ? `
         <div class="sf">
@@ -2461,6 +2804,36 @@ class NimbusWeatherCard extends HTMLElement {
     }
     console.log('[start] _startCanvas called, cond:', cond, 'isNight:', isNight);
     this._startCanvas(cond, isNight, attrs);
+    // v2: update modal rows on every render (modal DOM persists in _buildShell)
+    this._updateForecastModal(modalForecast, moonPhase, modalForecastType);
+    // Attach modal handlers only once
+    if (!this._modalHandlersAttached) {
+      this._modalHandlersAttached = true;
+      setTimeout(() => {
+        const backdrop = this.shadowRoot?.getElementById('fc-backdrop');
+        const modal    = this.shadowRoot?.getElementById('fc-modal');
+        const closeBtn = modal?.querySelector('.fc-modal-close');
+        if (closeBtn) closeBtn.addEventListener('click', e => {
+          e.stopPropagation();
+          backdrop?.classList.remove('open');
+          modal?.classList.remove('open');
+        });
+      }, 100);
+    }
+    // Re-attach expand button handler (ct innerHTML rebuilt each render)
+    setTimeout(() => {
+      const btn      = this.shadowRoot?.getElementById('fc-expand-btn');
+      const backdrop = this.shadowRoot?.getElementById('fc-backdrop');
+      const modal    = this.shadowRoot?.getElementById('fc-modal');
+      if (btn && backdrop && modal && !btn._nimbusHandled) {
+        btn._nimbusHandled = true;
+        btn.addEventListener('click', e => {
+          e.stopPropagation();
+          backdrop.classList.add('open');
+          modal.classList.add('open');
+        });
+      }
+    }, 50);
     this._initDetSplash(cond);
     this._tickClock();
     this._injectParticlesAsync(cond, isNight, moonPhase, attrs);
@@ -2470,6 +2843,56 @@ class NimbusWeatherCard extends HTMLElement {
     } else {
       this._destroyUfo();
     }
+  }
+
+  _updateForecastModal(forecast, moonPhase, forecastType = this._modalForecastType()) {
+    const rows = this.shadowRoot?.getElementById('fc-modal-rows');
+    const title = this.shadowRoot?.querySelector('.fc-modal-title');
+    if (title) title.textContent = this._forecastTitle(forecastType);
+    if (!rows) return;
+    if (!forecast.length) {
+      rows.innerHTML = `<div class="fc-modal-empty">No ${forecastType} forecast available</div>`;
+      return;
+    }
+    const allItems = forecast.slice(0, this._modalForecastLimit(forecastType));
+    const toNumber = v => typeof v === 'number' ? v : Number(v);
+    const tempValues = allItems.flatMap(f => {
+      const hi = toNumber(f.temperature);
+      const lo = toNumber(f.templow ?? f.temperature);
+      return [lo, hi].filter(Number.isFinite);
+    });
+    if (!tempValues.length) {
+      rows.innerHTML = `<div class="fc-modal-empty">No temperature data available</div>`;
+      return;
+    }
+    const absMin = Math.min(...tempValues);
+    const absMax = Math.max(...tempValues);
+    const range  = absMax - absMin || 1;
+    rows.innerHTML = allItems.map(f => {
+      const hi = toNumber(f.temperature);
+      const lo = forecastType === 'hourly' ? hi : toNumber(f.templow ?? f.temperature);
+      const safeHi = Number.isFinite(hi) ? hi : absMin;
+      const safeLo = Number.isFinite(lo) ? lo : safeHi;
+      const barLeft  = ((safeLo - absMin) / range) * 72;
+      const barWidth = forecastType === 'hourly' ? 8 : Math.max(((safeHi - safeLo) / range) * 72, 8);
+      if (forecastType === 'hourly') {
+        return `<div class="fc-modal-row">
+          <div class="fc-modal-day">${this._day(f.datetime, forecastType)}</div>
+          <div class="fc-modal-icon">${this.getCachedIcon(f.condition, this._isForecastNight(f), moonPhase)}</div>
+          <div class="fc-modal-temp">${this._t(f.temperature)}°</div>
+          <div class="fc-modal-bar-bg"><div class="fc-modal-bar-fill" style="width:${barWidth.toFixed(1)}%;margin-left:${barLeft.toFixed(1)}%"></div></div>
+          <div class="fc-modal-precip">${f.precipitation_probability > 0 ? f.precipitation_probability+'%' : ''}</div>
+        </div>`;
+      }
+      return `<div class="fc-modal-row">
+        <div class="fc-modal-day">${this._day(f.datetime, forecastType)}</div>
+        <div class="fc-modal-icon">${this.getCachedIcon(f.condition, this._isForecastNight(f), moonPhase)}</div>
+        <div class="fc-modal-lo">${this._t(safeLo)}°</div>
+        <div class="fc-modal-bar-bg"><div class="fc-modal-bar-fill" style="width:${barWidth.toFixed(1)}%;margin-left:${barLeft.toFixed(1)}%"></div></div>
+        <div class="fc-modal-hi">${this._t(safeHi)}°</div>
+        <div class="fc-modal-precip">${f.precipitation_probability > 0 ? f.precipitation_probability+'%' : ''}</div>
+      </div>`;
+    }).join('');
   }
 
   _tickClock() {
@@ -2742,6 +3165,35 @@ class NimbusWeatherCardEditor extends HTMLElement {
     return Object.keys(this._hass.states).filter(e => e.startsWith('sun.')).sort();
   }
 
+  _supportsForecastType(entity, forecastType) {
+    const features = Number(this._hass?.states?.[entity]?.attributes?.supported_features);
+    if (!Number.isFinite(features)) return true;
+    const FORECAST_DAILY = 1;
+    const FORECAST_HOURLY = 2;
+    return forecastType === 'hourly'
+      ? (features & FORECAST_HOURLY) !== 0
+      : (features & FORECAST_DAILY) !== 0;
+  }
+
+  _forecastSupportWarning() {
+    const entity = this._config.entity;
+    if (!entity || !this._hass?.states?.[entity]) return '';
+
+    const selectedType = this._val('forecast_type', 'daily');
+    const modalType = selectedType === 'hourly' ? 'daily' : 'hourly';
+    const warnings = [];
+
+    if (!this._supportsForecastType(entity, selectedType)) {
+      warnings.push(`The selected ${selectedType} forecast may not be available for this entity.`);
+    }
+    if (!this._supportsForecastType(entity, modalType)) {
+      warnings.push(`The modal ${modalType} forecast may not be available, so the modal can be empty.`);
+    }
+
+    if (!warnings.length) return '';
+    return `<div class="warning">${warnings.join(' ')}</div>`;
+  }
+
   _render() {
     this._rendered = true;
     const c = this._config;
@@ -2782,6 +3234,16 @@ class NimbusWeatherCardEditor extends HTMLElement {
   .speed-row { display:flex; align-items:center; gap:12px; }
   .speed-row input[type=range] { flex:1; accent-color:var(--primary-color,#03a9f4); }
   .speed-val { font-size:13px; min-width:24px; text-align:right; color:var(--secondary-text-color); }
+  .warning {
+    margin:8px 0 4px;
+    padding:8px 10px;
+    border-radius:8px;
+    background:rgba(255,152,0,0.12);
+    border:1px solid rgba(255,152,0,0.35);
+    color:var(--primary-text-color);
+    font-size:12px;
+    line-height:1.4;
+  }
 </style>
 
 <!-- REQUIRED -->
@@ -2826,6 +3288,7 @@ class NimbusWeatherCardEditor extends HTMLElement {
       <option value="hourly" ${this._val('forecast_type','daily')==='hourly'?'selected':''}>Hourly</option>
     </select>
   </div>
+  ${this._forecastSupportWarning()}
   <div class="row">
     <div><div class="label">Max Items</div></div>
     <select id="max_items">
@@ -2838,9 +3301,10 @@ class NimbusWeatherCardEditor extends HTMLElement {
       <option value="en" ${this._val('language','en')==='en'?'selected':''}>English</option>
       <option value="es" ${this._val('language','en')==='es'?'selected':''}>Espanol</option>
       <option value="de" ${this._val('language','en')==='de'?'selected':''}>Deutsch</option>
-      <option value="nl" ${this._val('language','nl')==='nl'?'selected':''}>Nederlands</option>
+      <option value="nl" ${this._val('language','en')==='nl'?'selected':''}>Nederlands</option>
     </select>
-
+  </div>
+  <div class="row">
     <div><div class="label">Show Forecast Strip</div></div>
     ${this._toggle('show_forecast', this._val('show_forecast', true))}
   </div>
@@ -2926,6 +3390,28 @@ class NimbusWeatherCardEditor extends HTMLElement {
   <button id="add-sensor" style="width:100%;padding:8px;border-radius:8px;border:1px dashed var(--color-border-secondary);background:none;cursor:pointer;color:var(--color-text-secondary);font-size:14px" ${this._val('show_forecast',true)?'disabled':''}>+ Add sensor</button>` : ''}
 </div>
 
+<!-- TAP ACTION -->
+<div class="section">
+  <div class="section-title">Tap Action</div>
+  <div class="row">
+    <div><div class="label">Action</div><div class="sublabel">What happens on tap</div></div>
+    <select id="tap_action_type" style="background:rgba(255,255,255,0.1);color:white;border:1px solid rgba(255,255,255,0.2);border-radius:8px;padding:4px 8px">
+      <option value="more-info">More Info (default)</option>
+      <option value="navigate">Navigate</option>
+      <option value="url">Open URL</option>
+      <option value="none">None</option>
+    </select>
+  </div>
+  <div class="row" id="tap_action_path_row" style="display:none">
+    <div><div class="label">Navigation Path</div><div class="sublabel">e.g. /lovelace/weather</div></div>
+    <input type="text" id="tap_action_path" placeholder="/lovelace/weather" style="background:rgba(255,255,255,0.1);color:white;border:1px solid rgba(255,255,255,0.2);border-radius:8px;padding:4px 8px;width:160px">
+  </div>
+  <div class="row" id="tap_action_url_row" style="display:none">
+    <div><div class="label">URL</div><div class="sublabel">e.g. https://weather.com</div></div>
+    <input type="text" id="tap_action_url" placeholder="https://..." style="background:rgba(255,255,255,0.1);color:white;border:1px solid rgba(255,255,255,0.2);border-radius:8px;padding:4px 8px;width:160px">
+  </div>
+</div>
+
 <!-- PERFORMANCE -->
 <div class="section">
   <div class="section-title">Performance</div>
@@ -2961,6 +3447,20 @@ class NimbusWeatherCardEditor extends HTMLElement {
     this._abortController = new AbortController();
     const signal = this._abortController.signal;
     const sr = this.shadowRoot;
+
+    // Init tap_action fields from saved config
+    const savedTap = this._config?.tap_action;
+    const tapType = savedTap?.action || 'more-info';
+    const tapTypeEl = sr.getElementById('tap_action_type');
+    if (tapTypeEl) tapTypeEl.value = tapType;
+    const pathEl = sr.getElementById('tap_action_path');
+    if (pathEl) pathEl.value = savedTap?.navigation_path || '';
+    const urlEl = sr.getElementById('tap_action_url');
+    if (urlEl) urlEl.value = savedTap?.url_path || '';
+    const pathRow = sr.getElementById('tap_action_path_row');
+    if (pathRow) pathRow.style.display = tapType === 'navigate' ? 'flex' : 'none';
+    const urlRow = sr.getElementById('tap_action_url_row');
+    if (urlRow) urlRow.style.display = tapType === 'url' ? 'flex' : 'none';
 
     const getSensors = () => {
       const sensors = [];
@@ -3011,6 +3511,22 @@ class NimbusWeatherCardEditor extends HTMLElement {
       cfg.moon_entity = moon || undefined;
       const sun = sr.getElementById('sun_entity')?.value;
       cfg.sun_entity = sun || undefined;
+      // tap_action
+      const tapType = sr.getElementById('tap_action_type')?.value || 'more-info';
+      if (tapType === 'more-info') {
+        cfg.tap_action = null;
+      } else if (tapType === 'navigate') {
+        const path = sr.getElementById('tap_action_path')?.value?.trim();
+        cfg.tap_action = { action: 'navigate', navigation_path: path || '/lovelace/0' };
+      } else if (tapType === 'url') {
+        const url = sr.getElementById('tap_action_url')?.value?.trim();
+        cfg.tap_action = { action: 'url', url_path: url || '' };
+      } else if (tapType === 'none') {
+        cfg.tap_action = { action: 'none' };
+      }
+      // show/hide path & url rows
+      sr.getElementById('tap_action_path_row').style.display = tapType === 'navigate' ? 'flex' : 'none';
+      sr.getElementById('tap_action_url_row').style.display  = tapType === 'url'      ? 'flex' : 'none';
       this._config = cfg;
       this._fire(cfg);
     };
