@@ -1,4 +1,4 @@
-// Nimbus Weather Card v2.2.0
+// Nimbus Weather Card v2.3.0
 // https://github.com/maxfok/nimbus-weather-card
 // (c) 2024 Gerasimos Fokaefs — MIT License
 
@@ -328,6 +328,13 @@ class NimbusWeatherCard extends HTMLElement {
     this._wxState = { condition: null, isNight: false, elevation: 0, t: 0 };
     this._iconCache = new Map();
     this._renderDebounced = this._debounce(this._render.bind(this), 100);
+    this._bgActiveLayer = 0;
+    this._lastBgKey = null;
+    this._bgFadeTimer = null;
+    this._bgFadeMs = 180000;
+    this._sunThresholdTimer = null;
+    this._stormLightTimer = null;
+    this._lastModalTrigger = null;
   }
 
   _debounce(func, wait) {
@@ -373,6 +380,7 @@ class NimbusWeatherCard extends HTMLElement {
       local_sensors: config.local_sensors || [],
       ufo_easter_egg: config.ufo_easter_egg !== false,
       latitude_zone: config.latitude_zone || 'northern_temperate',
+      aurora_override: config.aurora_override || false,
       tap_action: config.tap_action || null,
     };
   }
@@ -459,6 +467,12 @@ class NimbusWeatherCard extends HTMLElement {
     if (this._clockInterval) { clearInterval(this._clockInterval); this._clockInterval = null; }
     if (this._rafId)        { cancelAnimationFrame(this._rafId);  this._rafId        = null; }
     if (this._ufoTimer)     { clearTimeout(this._ufoTimer);       this._ufoTimer     = null; }
+    if (this._bgFadeTimer)  { clearTimeout(this._bgFadeTimer);    this._bgFadeTimer  = null; }
+    if (this._sunThresholdTimer) { clearTimeout(this._sunThresholdTimer); this._sunThresholdTimer = null; }
+    if (this._stormLightTimer) { clearTimeout(this._stormLightTimer); this._stormLightTimer = null; }
+    const card = this.shadowRoot?.getElementById('card');
+    card?.classList.remove('storm-lit');
+    card?.style.removeProperty('--storm-lit');
     this._unsubscribeForecasts();
     this._ufoActive = false;
   }
@@ -594,9 +608,16 @@ _moonPhase() {
     };
   }
 
+  _sunState() {
+    const configured = this._config?.sun_entity;
+    if (configured && this._hass?.states?.[configured]) return this._hass.states[configured];
+    return this._hass?.states?.['sun.sun'] || null;
+  }
+
   _sunElevation() {
-    if (this._config.sun_entity && this._hass.states[this._config.sun_entity]) {
-      const elevation = parseFloat(this._hass.states[this._config.sun_entity].attributes.elevation);
+    const sun = this._sunState();
+    if (sun) {
+      const elevation = parseFloat(sun.attributes.elevation);
       return isNaN(elevation) ? 45 : elevation;
     }
     const h = new Date().getHours() + new Date().getMinutes() / 60;
@@ -604,12 +625,112 @@ _moonPhase() {
   }
 
   _sunAzimuth() {
-    if (this._config.sun_entity && this._hass?.states[this._config.sun_entity]) {
-      const az = parseFloat(this._hass.states[this._config.sun_entity].attributes.azimuth);
+    const sun = this._sunState();
+    if (sun) {
+      const az = parseFloat(sun.attributes.azimuth);
       return isNaN(az) ? 180 : az;
     }
     const h = new Date().getHours() + new Date().getMinutes() / 60;
     return Math.max(0, Math.min(360, (h - 6) / 12 * 180 + 90));
+  }
+
+  _sunCoords() {
+    const lat = Number(this._hass?.config?.latitude);
+    const lon = Number(this._hass?.config?.longitude);
+    if (Number.isFinite(lat) && Number.isFinite(lon)) return { lat, lon };
+    return null;
+  }
+
+  _dayOfYear(date) {
+    const start = Date.UTC(date.getUTCFullYear(), 0, 0);
+    return Math.floor((date.getTime() - start) / 86400000);
+  }
+
+  _sunElevationAt(date) {
+    const coords = this._sunCoords();
+    if (!coords) return null;
+
+    const rad = Math.PI / 180;
+    const deg = 180 / Math.PI;
+    const N = this._dayOfYear(date);
+    const hours = date.getUTCHours() + date.getUTCMinutes() / 60 + date.getUTCSeconds() / 3600;
+    const gamma = 2 * Math.PI / 365 * (N - 1 + (hours - 12) / 24);
+    const eqTime = 229.18 * (
+      0.000075 + 0.001868 * Math.cos(gamma) - 0.032077 * Math.sin(gamma) -
+      0.014615 * Math.cos(2 * gamma) - 0.040849 * Math.sin(2 * gamma)
+    );
+    const decl =
+      0.006918 - 0.399912 * Math.cos(gamma) + 0.070257 * Math.sin(gamma) -
+      0.006758 * Math.cos(2 * gamma) + 0.000907 * Math.sin(2 * gamma) -
+      0.002697 * Math.cos(3 * gamma) + 0.00148 * Math.sin(3 * gamma);
+    const timeOffset = eqTime + 4 * coords.lon;
+    const trueSolarTime = ((hours * 60 + timeOffset) % 1440 + 1440) % 1440;
+    let hourAngle = trueSolarTime / 4 - 180;
+    if (hourAngle < -180) hourAngle += 360;
+
+    return Math.asin(
+      Math.sin(coords.lat * rad) * Math.sin(decl) +
+      Math.cos(coords.lat * rad) * Math.cos(decl) * Math.cos(hourAngle * rad)
+    ) * deg;
+  }
+
+  _nextSunThresholdTime() {
+    const thresholds = [-18, -6, -0.5, 1, 5, 12, 20, 35, 55];
+    const now = Date.now();
+    const step = 2 * 60 * 1000;
+    const end = now + 24 * 60 * 60 * 1000;
+    let prevT = now;
+    let prevElev = this._sunElevationAt(new Date(prevT));
+    if (prevElev === null) return null;
+
+    for (let t = now + step; t <= end; t += step) {
+      const elev = this._sunElevationAt(new Date(t));
+      if (elev === null) return null;
+      for (const threshold of thresholds) {
+        const prev = prevElev - threshold;
+        const curr = elev - threshold;
+        if ((prev <= 0 && curr >= 0) || (prev >= 0 && curr <= 0)) {
+          let lo = prevT, hi = t, loValue = prev;
+          for (let i = 0; i < 28; i++) {
+            const mid = (lo + hi) / 2;
+            const midElev = this._sunElevationAt(new Date(mid));
+            if (midElev === null) break;
+            const mv = midElev - threshold;
+            if ((loValue <= 0 && mv >= 0) || (loValue >= 0 && mv <= 0)) {
+              hi = mid;
+            } else {
+              lo = mid;
+              loValue = mv;
+            }
+          }
+          return new Date((lo + hi) / 2);
+        }
+      }
+      prevT = t;
+      prevElev = elev;
+    }
+    return null;
+  }
+
+  _scheduleSunThresholdRender() {
+    if (this._sunThresholdTimer) {
+      clearTimeout(this._sunThresholdTimer);
+      this._sunThresholdTimer = null;
+    }
+    if (!this.isConnected || !this._hass || !this._config) return;
+
+    const next = this._nextSunThresholdTime();
+    const fallback = 60 * 1000;
+    const delay = next
+      ? Math.max(1000, Math.min(next.getTime() - Date.now() + 500, 6 * 60 * 60 * 1000))
+      : fallback;
+
+    this._sunThresholdTimer = setTimeout(() => {
+      this._sunThresholdTimer = null;
+      if (!this.isConnected || !this._hass || !this._config) return;
+      this._renderContent();
+      this._scheduleSunThresholdRender();
+    }, delay);
   }
 
   // Επιστρέφει wind speed σε m/s (για cloud animation speed)
@@ -652,20 +773,25 @@ _moonPhase() {
     // Αν η condition είναι ρητά νυχτερινή → νύχτα
     if (condition && condition.includes('night')) return true;
 
-    // Αν έχουμε sun_entity → ελέγχουμε elevation
-    if (this._config && this._config.sun_entity && this._hass) {
-      const sun = this._hass.states[this._config.sun_entity];
-      if (sun) {
-        const el = parseFloat(sun.attributes?.elevation);
-        // Μικρό threshold: κάτω από 1° θεωρείται νύχτα
-        // (ο ήλιος μπορεί να έχει ανατείλει αλλά το weather να λέει ακόμα clear-night)
-        if (!isNaN(el)) return el < 1;
-        return sun.state === 'below_horizon';
-      }
+    // Prefer the configured sun entity, or Home Assistant's built-in sun.sun.
+    const sun = this._sunState();
+    if (sun) {
+      const el = parseFloat(sun.attributes?.elevation);
+      // Μικρό threshold: κάτω από 1° θεωρείται νύχτα
+      // (ο ήλιος μπορεί να έχει ανατείλει αλλά το weather να λέει ακόμα clear-night)
+      if (!isNaN(el)) return el < 1;
+      return sun.state === 'below_horizon';
     }
     // Fallback σε ώρα
     const h = new Date().getHours();
     return h < 6 || h >= 20;
+  }
+
+  _isAurora(condition, isNight) {
+    if (!isNight) return false;
+    if (condition !== 'clear-night' && condition !== 'sunny') return false;
+    if (this._config.aurora_override) return true;
+    return this._config.latitude_zone === 'arctic';
   }
 
   _bgClass(condition, isNight) {
@@ -798,21 +924,96 @@ _moonPhase() {
     // Δημιουργία static array μία φορά (ή μετά από resize)
     if (!this._stars || this._stars.length !== STAR_COUNT) {
       this._stars = Array.from({ length: STAR_COUNT }, () => ({
-        x:     Math.random() * W,
-        y:     Math.random() * H * 0.85,
-        r:     0.5 + Math.random() * 1.2,
-        phase: Math.random() * Math.PI * 2,
-        speed: 0.4 + Math.random() * 0.8,
+        x:      Math.random() * W,
+        y:      Math.random() * H * 0.85,
+        r:      0.5 + Math.random() * 1.2,
+        phase:  Math.random() * Math.PI * 2,
+        speed:  0.4 + Math.random() * 0.8,
+        fadeIn: 1,
       }));
     }
 
-    this._stars.forEach(s => {
-      const alpha = 0.4 + 0.6 * (0.5 + 0.5 * Math.sin(t * s.speed + s.phase));
+    this._stars.forEach((s, i) => {
+      // Κρύβω το αστέρι αν είναι ενεργό shooting star
+      const isShooting = this._shootState && this._shootState.active && this._shootState.idx === i;
+      if (isShooting && s.fadeIn === 0) return;
+      // Αργό fade in (για shooting star επανεμφάνιση)
+      if (s.fadeIn < 1) s.fadeIn = Math.min(1, s.fadeIn + 0.006);
+      const twinkle = 0.4 + 0.6 * (0.5 + 0.5 * Math.sin(t * s.speed + s.phase));
+      const alpha   = s.fadeIn * twinkle;
       ctx.beginPath();
       ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2);
       ctx.fillStyle = `rgba(255,255,255,${alpha.toFixed(2)})`;
       ctx.fill();
     });
+  }
+
+  // ── Layer 1b (νύχτα): Shooting Star ──────────────────
+  _drawShootingStar(ctx, W, H, condition, t) {
+    if (condition !== 'clear-night') return;
+    if (!this._stars || !this._stars.length) return;
+
+    if (!this._shootState) {
+      this._shootState = { active: false, nextT: t + 4 + Math.random() * 8 };
+    }
+    const ss = this._shootState;
+
+    if (!ss.active && t >= ss.nextT) {
+      const idx  = Math.floor(Math.random() * this._stars.length);
+      const s    = this._stars[idx];
+      const goRight = s.x < W / 2;
+      const angle = goRight
+        ? (15 + Math.random() * 20) * Math.PI / 180
+        : (Math.PI - (15 + Math.random() * 20) * Math.PI / 180);
+      const spd = 2.5 + Math.random() * 2;
+      ss.active  = true;
+      ss.idx     = idx;
+      ss.x       = s.x;
+      ss.y       = s.y;
+      ss.vx      = Math.cos(angle) * spd;
+      ss.vy      = Math.sin(angle) * spd;
+      ss.life    = 0;
+      ss.maxLife = 45;
+      ss.trail   = [];
+      s.fadeIn   = 0;
+    }
+
+    if (!ss.active) return;
+
+    ss.life++;
+    ss.x += ss.vx;
+    ss.y += ss.vy;
+    ss.trail.push({ x: ss.x, y: ss.y });
+    if (ss.trail.length > 8) ss.trail.shift();
+
+    const progress = ss.life / ss.maxLife;
+    const opacity  = progress < 0.15 ? progress / 0.15
+      : progress > 0.75 ? 1 - (progress - 0.75) / 0.25
+      : 1;
+
+    for (let i = 1; i < ss.trail.length; i++) {
+      const a  = (i / ss.trail.length) * opacity * 0.75;
+      const t0 = ss.trail[i - 1];
+      const t1 = ss.trail[i];
+      ctx.beginPath();
+      ctx.moveTo(t0.x, t0.y);
+      ctx.lineTo(t1.x, t1.y);
+      ctx.strokeStyle = `rgba(255,255,255,${a.toFixed(2)})`;
+      ctx.lineWidth   = this._stars[ss.idx].r * 1.1;
+      ctx.stroke();
+    }
+
+    ctx.beginPath();
+    ctx.arc(ss.x, ss.y, this._stars[ss.idx].r * 1.3, 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(255,255,255,${opacity.toFixed(2)})`;
+    ctx.fill();
+
+    if (ss.life >= ss.maxLife) {
+      this._stars[ss.idx].fadeIn = 0;
+      ss.active = false;
+      ss.nextT  = t + 4 + Math.random() * 8;
+      ss.trail  = [];
+    }
   }
 
   // ── Layer 2 (νύχτα): Φεγγάρι — CSS div ─────────────
@@ -825,7 +1026,7 @@ _moonPhase() {
         position:absolute;
         border-radius:50%;
         pointer-events:none;
-        z-index:2;
+        z-index:3;
         animation:moonFloat 12s ease-in-out infinite;
       `;
       // Inner div: texture + rotation + phase shadow (overflow:hidden για clip)
@@ -879,8 +1080,10 @@ _moonPhase() {
     moonDiv.style.top      = '24px';
     moonDiv.style.right    = '24px';
     // Hide moon when sun is above horizon
+    // Exception: if condition is explicitly 'clear-night', trust it and show moon
     const sunEl = this._sunElevation();
-    const finalMoonOpacity = sunEl > 2 ? 0 : moonOpacity;
+    const isClearNight = condition === 'clear-night';
+    const finalMoonOpacity = (!isClearNight && sunEl > 2) ? 0 : moonOpacity;
     moonDiv.style.opacity  = finalMoonOpacity.toFixed(2);
     moonDiv.style.transition = 'opacity 30s ease';
     // Rotate moon based on latitude zone — apply to inner div to avoid conflicting with moonFloat
@@ -1124,6 +1327,7 @@ _moonPhase() {
       canvas.height = Math.round(rect.height * dpr);
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       this._stars = null; // reset stars on resize
+      this._shootState = null; // reset shooting star on resize
       this._cloudKey = null; // mobile layout can settle after first paint
     }
 
@@ -1141,6 +1345,8 @@ _moonPhase() {
     if (isNight) {
       // Layer 1: Stars
       this._drawStars(ctx, W, H, condition, t);
+      // Layer 1b: Shooting Star
+      this._drawShootingStar(ctx, W, H, condition, t);
       // Layer 2: Moon (CSS div)
       this._updateMoonDiv(condition, t);
     } else {
@@ -1166,7 +1372,7 @@ _moonPhase() {
   }
 
   _drawFx(ctx, W, H, condition, isNight, t) {
-    console.log('[fx] condition:', condition, 'isNight:', isNight);
+    // removed fx log
     const c    = condition;
     const attrs = this._wxState.attrs || {};
     const isRain   = ['rainy','pouring','lightning-rainy','snowy-rainy'].includes(c);
@@ -1185,7 +1391,7 @@ _moonPhase() {
     if (c === 'fog') this._drawFog(ctx, W, H, t);
     if (['windy','windy-variant'].includes(c)) this._drawLeaves(ctx, W, H, t);
     // Droplets στο ξεχωριστό dp-canvas
-    console.log('[dp] canvas:', !!this._dpCanvas, 'ctx:', !!this._dpCtx, 'isDrop:', isDrop, 'el:', !!this.shadowRoot?.getElementById('dp-canvas'));
+    // removed dp log
     if (this._dpCanvas && this._dpCtx) {
       const dpr = window.devicePixelRatio || 1;
       if (this._dpCanvas.width !== Math.round(W*dpr)) {
@@ -1556,7 +1762,7 @@ _clearDroplets() {
     if (L.flashOpacity > 0) {
       ctx.fillStyle = `rgba(200,220,255,${L.flashOpacity.toFixed(3)})`;
       ctx.fillRect(0, 0, W, H);
-      L.flashOpacity = Math.max(0, L.flashOpacity - 0.06);
+      L.flashOpacity = Math.max(0, L.flashOpacity - 0.045);
     }
 
     // Draw & fade bolts
@@ -1564,7 +1770,7 @@ _clearDroplets() {
       const b = L.bolts[i];
       this._drawBolt(ctx, b.pts, b.alpha);
       b.branches.forEach(br => this._drawBolt(ctx, br, b.alpha * 0.6));
-      b.alpha -= 0.04;
+      b.alpha -= 0.032;
       if (b.alpha <= 0) L.bolts.splice(i, 1);
     }
 
@@ -1572,6 +1778,95 @@ _clearDroplets() {
     if (t > L.nextStrike) {
       this._strikeLightning(ctx, W, H, L);
       L.nextStrike = t + 2.0 + Math.random() * 4.0;
+    }
+  }
+
+  _triggerLightningFlash(xPct = 50, yPct = 24, intensity = 1) {
+    const flash = this.shadowRoot?.getElementById('lightning-flash');
+    if (!flash) return;
+
+    const core = Math.min(0.58, 0.34 + intensity * 0.10);
+    const glow = Math.min(0.34, 0.18 + intensity * 0.08);
+    const wash = Math.min(0.28, 0.12 + intensity * 0.07);
+
+    flash.style.setProperty('--flash-x', `${Math.max(8, Math.min(92, xPct)).toFixed(1)}%`);
+    flash.style.setProperty('--flash-y', `${Math.max(6, Math.min(68, yPct)).toFixed(1)}%`);
+    flash.style.setProperty('--flash-core', core.toFixed(2));
+    flash.style.setProperty('--flash-glow', glow.toFixed(2));
+    flash.style.setProperty('--flash-wash', wash.toFixed(2));
+    flash.classList.remove('burst');
+    void flash.offsetWidth;
+    flash.classList.add('burst');
+
+    const card = this.shadowRoot?.getElementById('card');
+    if (card) {
+      const lift = Math.min(0.46, 0.20 + intensity * 0.10);
+      card.style.setProperty('--storm-lit', lift.toFixed(2));
+      card.classList.add('storm-lit');
+      if (this._stormLightTimer) clearTimeout(this._stormLightTimer);
+      this._stormLightTimer = setTimeout(() => {
+        card.classList.remove('storm-lit');
+        card.style.removeProperty('--storm-lit');
+        this._stormLightTimer = null;
+      }, 1100);
+    }
+  }
+
+  _haptic(style = 'selection') {
+    try {
+      this.dispatchEvent(new CustomEvent('haptic', {
+        detail: style,
+        bubbles: true,
+        composed: true,
+      }));
+    } catch(e) {}
+
+    try {
+      if (typeof navigator !== 'undefined' && typeof navigator.vibrate === 'function') {
+        navigator.vibrate(style === 'selection' || style === 'light' ? 10 : 18);
+      }
+    } catch(e) {}
+  }
+
+  _modalEls() {
+    return {
+      backdrop: this.shadowRoot?.getElementById('fc-backdrop'),
+      modal: this.shadowRoot?.getElementById('fc-modal'),
+    };
+  }
+
+  _isForecastModalOpen() {
+    return !!this.shadowRoot?.getElementById('fc-modal')?.classList.contains('open');
+  }
+
+  _openForecastModal(triggerEl) {
+    const { backdrop, modal } = this._modalEls();
+    if (!backdrop || !modal) return;
+    const wasOpen = modal.classList.contains('open');
+    this._lastModalTrigger = triggerEl || this.shadowRoot?.activeElement || null;
+    backdrop.classList.add('open');
+    modal.classList.add('open');
+    backdrop.setAttribute('aria-hidden', 'false');
+    modal.setAttribute('aria-hidden', 'false');
+    if (!wasOpen) {
+      this._haptic('selection');
+      requestAnimationFrame(() => modal.focus?.({ preventScroll: true }));
+    }
+  }
+
+  _closeForecastModal(style = 'light', restoreFocus = true) {
+    const { backdrop, modal } = this._modalEls();
+    const wasOpen = !!modal?.classList.contains('open');
+    backdrop?.classList.remove('open');
+    modal?.classList.remove('open');
+    backdrop?.setAttribute('aria-hidden', 'true');
+    modal?.setAttribute('aria-hidden', 'true');
+    if (wasOpen) {
+      this._haptic(style);
+      if (restoreFocus) {
+        const trigger = this._lastModalTrigger;
+        requestAnimationFrame(() => trigger?.focus?.({ preventScroll: true }));
+      }
     }
   }
 
@@ -1593,14 +1888,20 @@ _clearDroplets() {
     }
 
     L.bolts.push({ pts: main, branches, alpha: 1 });
-    L.flashOpacity = 0.12 + Math.random() * 0.15;
+    L.flashOpacity = 0.18 + Math.random() * 0.18;
+    this._triggerLightningFlash(
+      (startX / W) * 100,
+      Math.min(42, Math.max(12, (endY / H) * 45)),
+      1 + Math.random() * 0.4
+    );
 
     if (Math.random() > 0.5) {
       setTimeout(() => {
         const b2 = this._createBolt(startX + (Math.random()-0.5)*20, 0, endX + (Math.random()-0.5)*20, endY, W);
         L.bolts.push({ pts: b2, branches: [], alpha: 0.7 });
-        L.flashOpacity = Math.max(L.flashOpacity, 0.08);
-      }, 60 + Math.random() * 100);
+        L.flashOpacity = Math.max(L.flashOpacity, 0.12);
+        this._triggerLightningFlash((startX / W) * 100, 18 + Math.random() * 18, 0.7);
+      }, 90 + Math.random() * 120);
     }
   }
 
@@ -2178,7 +2479,7 @@ _clearDroplets() {
       this._initialized = false;
       this._lastParticleKey = null;
     }
-    console.log('[render] initialized:', this._initialized);
+    // removed render log
     if (!this._initialized) {
       this._buildShell();
       this._initialized = true;
@@ -2196,18 +2497,82 @@ _clearDroplets() {
       this._subscribeForecast(id);
     }
     this._renderContent();
+    this._scheduleSunThresholdRender();
   }
 
   _buildShell() {
+    if (this._bgFadeTimer) {
+      clearTimeout(this._bgFadeTimer);
+      this._bgFadeTimer = null;
+    }
+    if (this._stormLightTimer) {
+      clearTimeout(this._stormLightTimer);
+      this._stormLightTimer = null;
+    }
+    this._bgActiveLayer = 0;
+    this._lastBgKey = null;
     this.shadowRoot.innerHTML = `
 <style>
 :host { display:block; font-family:system-ui,-apple-system,sans-serif; width:100%; position:relative; z-index:0; isolation:isolate }
 .wrapper { position:relative; border-radius:24px; width:100% }
 
 /* ── BACKGROUNDS ── */
-.bg { position:absolute; inset:0; border-radius:24px; z-index:0; transition:background 0.8s ease }
+.bg { position:absolute; inset:0; border-radius:24px; z-index:0; pointer-events:none; opacity:1; transition:opacity 180s ease; will-change:opacity }
 .bg-sunny          { background:linear-gradient(180deg,#1a85d6 0%,#47a0e4 25%,#7ec5f0 50%,#b8ddf7 75%,#e4eefc 100%) }
-.bg-night          { background:linear-gradient(145deg,#09102b,#192060) }
+.bg-night          { background:linear-gradient(145deg,#06152c,#0b2a5a) }
+
+/* ── AURORA BOREALIS ── */
+.aurora-layer {
+  position:absolute; left:-30%; width:160%; border-radius:999px;
+  transform-origin:center; will-change:transform;
+  animation-name:auroraFlow; animation-timing-function:ease-in-out; animation-iteration-count:infinite; animation-direction:alternate;
+}
+.aurora-green {
+  top:15%; height:25%;
+  background:linear-gradient(90deg,
+    transparent 0%, rgba(80,255,190,0) 5%, rgba(80,255,190,.5) 15%,
+    rgba(120,255,220,1) 32%, rgba(70,255,180,.7) 44%,
+    rgba(120,255,220,.9) 56%, rgba(80,255,190,.5) 70%,
+    rgba(80,255,190,0) 85%, transparent 100%);
+  animation-duration:10s;
+}
+.aurora-blue {
+  top:30%; height:20%;
+  background:linear-gradient(90deg,
+    transparent 0%, rgba(80,170,255,0) 5%, rgba(80,170,255,.5) 15%,
+    rgba(120,220,255,1) 34%, rgba(90,180,255,.7) 48%,
+    rgba(120,220,255,.9) 60%, rgba(80,170,255,.5) 74%,
+    rgba(80,170,255,0) 88%, transparent 100%);
+  animation-duration:14s; animation-delay:-4s;
+}
+.aurora-purple {
+  top:10%; height:18%;
+  background:linear-gradient(90deg,
+    transparent 0%, rgba(190,92,255,0) 8%, rgba(190,92,255,.45) 20%,
+    rgba(210,120,255,.85) 36%, rgba(190,92,255,.55) 50%,
+    rgba(210,120,255,.80) 64%, rgba(190,92,255,.40) 76%,
+    rgba(190,92,255,0) 88%, transparent 100%);
+  animation-duration:18s; animation-delay:-6s;
+}
+.aurora-ribbon {
+  position:absolute; top:18%; left:-30%; width:160%; height:26%;
+  border-radius:999px;
+  background:linear-gradient(90deg,
+    transparent 0%, rgba(120,255,206,0) 12%, rgba(120,255,206,.10) 22%,
+    rgba(90,195,255,.22) 40%, rgba(196,118,255,.16) 54%,
+    rgba(120,255,206,.08) 70%, rgba(120,255,206,0) 84%, transparent 100%);
+  filter:blur(28px) saturate(1.7); transform:rotate(-7deg); opacity:.70;
+  mix-blend-mode:screen;
+  animation:auroraRibbonFlow 20s ease-in-out infinite alternate;
+}
+@keyframes auroraFlow {
+  0%   { transform:translateX(-18%) rotate(var(--rot,-6deg)) scaleX(.94); }
+  100% { transform:translateX(18%)  rotate(var(--rot,-6deg)) scaleX(1.06); }
+}
+@keyframes auroraRibbonFlow {
+  0%   { transform:translateX(-16%) rotate(-7deg) scaleX(.92); opacity:.35; }
+  100% { transform:translateX(16%)  rotate(-5deg) scaleX(1.04); opacity:.72; }
+}
 .bg-partlycloudy   { background:linear-gradient(145deg,#5aaaf5,#b7d8f8) }
 .bg-cloudy-night   { background:linear-gradient(145deg,#1a2540,#2e4060) }
 .bg-cloudy         { background:linear-gradient(145deg,#5c7ea8,#a8c0d8) }
@@ -2226,12 +2591,46 @@ _clearDroplets() {
 .bg-default        { background:linear-gradient(145deg,#3a7bd5,#00d2ff) }
 
 /* ── PARTICLE LAYER ── */
-#wx-canvas { position:absolute; inset:0; width:100%; height:100%; border-radius:24px; pointer-events:none; z-index:0 }
-#fx-canvas { position:absolute; inset:0; width:100%; height:100%; border-radius:24px; pointer-events:none; z-index:1 }
-#dp-canvas { position:absolute; inset:0; width:100%; height:100%; border-radius:24px; pointer-events:none; z-index:8 }
+#wx-canvas { position:absolute; inset:0; width:100%; height:100%; border-radius:24px; pointer-events:none; z-index:1 }
+#aurora-layer { position:absolute; inset:0; width:100%; height:100%; border-radius:24px; pointer-events:none; z-index:2; overflow:hidden; filter:blur(22px) saturate(2) brightness(1.6) }
+#fx-canvas { position:absolute; inset:0; width:100%; height:100%; border-radius:24px; pointer-events:none; z-index:4 }
+#lightning-flash {
+  position:absolute; inset:0; border-radius:24px; pointer-events:none; z-index:6;
+  opacity:0; mix-blend-mode:screen; will-change:opacity;
+  background:
+    radial-gradient(circle 190px at var(--flash-x,50%) var(--flash-y,24%),
+      rgba(255,255,255,var(--flash-core,0.42)) 0%,
+      rgba(205,225,255,var(--flash-glow,0.24)) 24%,
+      rgba(130,170,255,0.10) 48%,
+      transparent 72%),
+    linear-gradient(180deg,
+      rgba(235,242,255,var(--flash-wash,0.18)) 0%,
+      rgba(170,200,255,0.08) 46%,
+      rgba(80,120,220,0.02) 100%);
+}
+#lightning-flash.burst { animation:nimbusLightningFlash 760ms ease-out; }
+@keyframes nimbusLightningFlash {
+  0%   { opacity:0 }
+  4%   { opacity:1 }
+  11%  { opacity:.18 }
+  19%  { opacity:.92 }
+  31%  { opacity:.28 }
+  58%  { opacity:.10 }
+  100% { opacity:0 }
+}
+#dp-canvas { position:absolute; inset:0; width:100%; height:100%; border-radius:24px; pointer-events:none; z-index:7 }
+#ptcl-clouds, #ptcl-weather, #fx-canvas, #dp-canvas { transition:filter 900ms ease-out }
+.card.storm-lit #ptcl-clouds,
+.card.storm-lit #ptcl-weather {
+  filter:brightness(calc(1 + var(--storm-lit, .28))) saturate(1.12) contrast(1.06);
+}
+.card.storm-lit #fx-canvas,
+.card.storm-lit #dp-canvas {
+  filter:brightness(calc(1 + var(--storm-lit, .22))) contrast(1.04);
+}
 
 /* ── CONTENT ── */
-.ct { position:relative; z-index:4; padding:18px; color:#fff; text-shadow:0 2px 4px rgba(0,0,0,0.35), 0 0 8px rgba(0,0,0,0.2) }
+.ct { position:relative; z-index:6; padding:18px; color:#fff; text-shadow:0 2px 4px rgba(0,0,0,0.35), 0 0 8px rgba(0,0,0,0.2) }
 .entity-error { min-height:170px; display:flex; flex-direction:column; justify-content:center; gap:8px; }
 .entity-error-title { font-size:15px; font-weight:700; letter-spacing:.02em; }
 .entity-error-subtitle { font-size:12px; line-height:1.4; opacity:.75; max-width:260px; }
@@ -2400,7 +2799,7 @@ _clearDroplets() {
 @keyframes pcGlow { 0%,100%{transform:scale3d(1,1,1);opacity:.7} 50%{transform:scale3d(1.08,1.08,1);opacity:1} }
 
 /* ── LIGHTNING ── */
-.lx-layer { position:absolute; inset:0; pointer-events:none; z-index:3 }
+.lx-layer { position:absolute; inset:0; pointer-events:none; z-index:5 }
 .lx-bolt { position:absolute; top:0; width:40px; height:100%; animation:boltFade .35s ease-out forwards; will-change:opacity; z-index:3 }
 @keyframes boltFade { 0%{opacity:1} 30%{opacity:.9} 100%{opacity:0} }
 .lx-flash { position:absolute; inset:0; background:rgba(200,200,255,0.08); animation:lxf 7s ease-in-out infinite; will-change:opacity }
@@ -2495,10 +2894,12 @@ _clearDroplets() {
 .fc-expand-btn:hover span, .fc-expand-btn:hover svg { color:rgba(255,255,255,0.6); opacity:0.6; }
 /* v2: Forecast modal */
 .fc-modal-backdrop { position:absolute; inset:0; z-index:20; background:rgba(0,0,0,0.55); border-radius:24px; backdrop-filter:blur(6px); opacity:0; pointer-events:none; transition:opacity 0.3s; }
-.fc-modal-backdrop.open { opacity:1; pointer-events:none; }
-.fc-modal { position:absolute; left:0; right:0; bottom:0; z-index:21; background:linear-gradient(180deg,rgba(8,18,40,0.97) 0%,rgba(4,10,24,0.99) 100%); border-top:1px solid rgba(255,255,255,0.12); border-radius:20px 20px 24px 24px; padding:0 0 16px; transform:translateY(100%); transition:transform 0.38s cubic-bezier(0.25,0.46,0.45,0.94); max-height:85%; overflow-y:auto; }
+.fc-modal-backdrop.open { opacity:1; pointer-events:auto; touch-action:none; }
+.fc-modal { position:absolute; left:0; right:0; bottom:0; z-index:21; background:linear-gradient(180deg,rgba(8,18,40,0.97) 0%,rgba(4,10,24,0.99) 100%); border-top:1px solid rgba(255,255,255,0.12); border-radius:20px 20px 24px 24px; padding:0 0 16px; transform:translateY(100%); transition:transform 0.38s cubic-bezier(0.25,0.46,0.45,0.94); max-height:85%; overflow-y:auto; overscroll-behavior:contain; -webkit-overflow-scrolling:touch; touch-action:pan-y; outline:none; }
 .fc-modal.open { transform:translateY(0); }
-.fc-modal-handle { width:32px; height:3px; border-radius:2px; background:rgba(255,255,255,0.18); margin:10px auto 0; }
+.fc-modal-handle, .fc-modal-header { touch-action:none; user-select:none; cursor:grab; }
+.fc-modal-handle { width:72px; height:22px; border-radius:999px; margin:3px auto 0; display:flex; align-items:center; justify-content:center; }
+.fc-modal-handle::before { content:""; width:38px; height:3px; border-radius:2px; background:rgba(255,255,255,0.26); box-shadow:0 0 10px rgba(255,255,255,0.08); }
 .fc-modal-title { font-size:11px; font-weight:600; letter-spacing:0.08em; color:rgba(255,255,255,0.38); text-transform:uppercase; text-align:center; padding:10px 16px 8px; }
 .fc-modal-row { display:flex; align-items:center; gap:8px; padding:9px 16px; border-bottom:1px solid rgba(255,255,255,0.05); }
 .fc-modal-row:last-child { border-bottom:none; }
@@ -2590,21 +2991,24 @@ _clearDroplets() {
 <div class="wrapper">
   <div class="card" id="card" role="button" tabindex="0" aria-label="Weather card, click for more details">
     <div class="bg" id="bg"></div>
+    <div class="bg" id="bg-fade"></div>
     <canvas id="wx-canvas"></canvas>
+    <div id="aurora-layer" style="display:none;opacity:0"></div>
     <canvas id="fx-canvas"></canvas>
+    <div id="lightning-flash"></div>
     <!-- v2: forecast modal — built once in _buildShell, survives re-renders -->
-    <div class="fc-modal-backdrop" id="fc-backdrop"></div>
-    <div class="fc-modal" id="fc-modal">
+    <div class="fc-modal-backdrop" id="fc-backdrop" aria-hidden="true"></div>
+    <div class="fc-modal" id="fc-modal" role="dialog" aria-modal="true" aria-hidden="true" tabindex="-1">
       <div class="fc-modal-handle"></div>
       <div class="fc-modal-header" style="display:flex;align-items:center;justify-content:space-between;padding:10px 16px 8px;">
         <div class="fc-modal-title" style="padding:0;">7-Day Forecast</div>
-        <div class="fc-modal-close" style="cursor:pointer;font-size:18px;color:rgba(255,255,255,0.35);line-height:1;padding:4px 6px;border-radius:8px;background:rgba(255,255,255,0.06);">✕</div>
+        <button type="button" class="fc-modal-close" aria-label="Close forecast" style="cursor:pointer;font-size:18px;color:rgba(255,255,255,0.35);line-height:1;padding:4px 6px;border-radius:8px;background:rgba(255,255,255,0.06);border:0;">✕</button>
       </div>
       <div id="fc-modal-rows"></div>
     </div>
-    <div id="ptcl-sunmoon" style="position:absolute;inset:0;pointer-events:none;z-index:2"></div>
-    <div id="ptcl-clouds" style="position:absolute;inset:0;pointer-events:none;z-index:3"></div>
-    <div id="ptcl-weather" style="position:absolute;inset:0;pointer-events:none;z-index:2"></div>
+    <div id="ptcl-sunmoon" style="position:absolute;inset:0;pointer-events:none;z-index:3"></div>
+    <div id="ptcl-clouds" style="position:absolute;inset:0;pointer-events:none;z-index:5"></div>
+    <div id="ptcl-weather" style="position:absolute;inset:0;pointer-events:none;z-index:5"></div>
     <canvas id="dp-canvas"></canvas>
     <div class="ct" id="ct"></div>
   </div>
@@ -2681,13 +3085,139 @@ _clearDroplets() {
     return d.toLocaleDateString(loc, { weekday: 'short' }).toUpperCase();
   }
 
+  _backgroundPhase(isNight) {
+    if (isNight) return 'night';
+    const el = Math.max(-30, Math.min(90, this._sunElevation()));
+    if (el < -18) return 'astronomical';
+    if (el < -6) return 'nautical';
+    if (el < -0.5) return 'blue-hour';
+    if (el < 5) return 'sunrise';
+    if (el < 12) return 'golden-hour';
+    if (el < 20) return 'early-morning';
+    if (el < 35) return 'morning';
+    if (el < 55) return 'day';
+    return 'bright-midday';
+  }
+
+  _backgroundSpec(condition, isNight, bgCls) {
+    const dynGrad = this._elevationBg(condition, isNight);
+    if (dynGrad) {
+      return {
+        key: 'dynamic:' + this._backgroundPhase(isNight),
+        className: 'bg',
+        background: dynGrad,
+      };
+    }
+    return { key: 'class:' + bgCls, className: 'bg ' + bgCls, background: '' };
+  }
+
+  _applyBackgroundSpec(el, spec) {
+    if (!el || !spec) return;
+    el.className = spec.className;
+    el.style.background = spec.background || '';
+  }
+
+  _resetBackgroundLayer(el, opacity) {
+    if (!el) return;
+    el.style.transition = 'none';
+    el.style.opacity = String(opacity);
+  }
+
+  _enableBackgroundFade(el) {
+    if (!el) return;
+    el.style.transition = `opacity ${this._bgFadeMs}ms ease`;
+  }
+
+  _updateBackground(condition, isNight, bgCls) {
+    const base = this.shadowRoot?.getElementById('bg');
+    const fade = this.shadowRoot?.getElementById('bg-fade');
+    if (!base) return;
+
+    const spec = this._backgroundSpec(condition, isNight, bgCls);
+    if (!fade) {
+      this._applyBackgroundSpec(base, spec);
+      this._lastBgKey = spec.key;
+      return;
+    }
+
+    if (this._lastBgKey === spec.key) {
+      const active = this._bgActiveLayer === 1 ? fade : base;
+      this._applyBackgroundSpec(active || base, spec);
+      return;
+    }
+    if (this._bgFadeTimer) {
+      clearTimeout(this._bgFadeTimer);
+      this._bgFadeTimer = null;
+    }
+
+    const layers = [base, fade];
+    const firstPaint = this._lastBgKey === null;
+
+    if (firstPaint) {
+      this._bgActiveLayer = 0;
+      this._applyBackgroundSpec(base, spec);
+      this._applyBackgroundSpec(fade, spec);
+      this._resetBackgroundLayer(base, 1);
+      this._resetBackgroundLayer(fade, 0);
+      // Force the initial state before enabling future opacity fades.
+      void base.offsetWidth;
+      this._enableBackgroundFade(base);
+      this._enableBackgroundFade(fade);
+      this._lastBgKey = spec.key;
+      return;
+    }
+
+    const activeIdx = this._bgActiveLayer === 1 ? 1 : 0;
+    const nextIdx = activeIdx === 0 ? 1 : 0;
+    const active = layers[activeIdx];
+    const next = layers[nextIdx];
+
+    this._applyBackgroundSpec(next, spec);
+    this._resetBackgroundLayer(next, nextIdx === 0 ? 1 : 0);
+    this._resetBackgroundLayer(active, 1);
+
+    // Force the browser to paint the prepared layer before the cross-fade.
+    void next.offsetWidth;
+
+    this._enableBackgroundFade(active);
+    this._enableBackgroundFade(next);
+
+    requestAnimationFrame(() => {
+      if (nextIdx === 1) {
+        next.style.opacity = '1';
+      } else {
+        active.style.opacity = '0';
+      }
+    });
+
+    const previous = active;
+    this._bgActiveLayer = nextIdx;
+    this._lastBgKey = spec.key;
+    this._bgFadeTimer = setTimeout(() => {
+      this._resetBackgroundLayer(previous, 0);
+      this._resetBackgroundLayer(next, 1);
+      this._enableBackgroundFade(previous);
+      this._enableBackgroundFade(next);
+      this._bgFadeTimer = null;
+    }, this._bgFadeMs + 120);
+  }
+
   _renderEntityError(entityId) {
     const bgEl = this.shadowRoot?.getElementById('bg');
-    if (bgEl) {
-      bgEl.className = 'bg bg-default';
-      bgEl.style.background = '';
-      bgEl.style.transition = '';
+    const bgFadeEl = this.shadowRoot?.getElementById('bg-fade');
+    if (this._bgFadeTimer) {
+      clearTimeout(this._bgFadeTimer);
+      this._bgFadeTimer = null;
     }
+    this._bgActiveLayer = 0;
+    this._lastBgKey = null;
+    [bgEl, bgFadeEl].forEach((el, idx) => {
+      if (!el) return;
+      el.className = 'bg bg-default';
+      el.style.background = '';
+      el.style.transition = 'none';
+      el.style.opacity = idx === 0 ? '1' : '0';
+    });
     ['ptcl-sunmoon', 'ptcl-clouds', 'ptcl-weather'].forEach(id => {
       const el = this.shadowRoot?.getElementById(id);
       if (el) el.innerHTML = '';
@@ -2738,14 +3268,24 @@ _clearDroplets() {
 
     const bgEl = this.shadowRoot.getElementById('bg');
     if (bgEl) {
-      bgEl.className = 'bg ' + bgCls;
-      const dynGrad = this._elevationBg(cond, isNight);
-      if (dynGrad) {
-        bgEl.style.background = dynGrad;
-        bgEl.style.transition = 'background 3s ease';
-      } else {
-        bgEl.style.background = '';
-        bgEl.style.transition = '';
+      this._updateBackground(cond, isNight, bgCls);
+      // Aurora borealis overlay — dedicated layer above wx-canvas
+      const auroraActive = this._isAurora(cond, isNight);
+      const auroraLayerEl = this.shadowRoot.getElementById('aurora-layer');
+      if (auroraLayerEl) {
+        if (!auroraLayerEl.querySelector('.aurora-wrap')) {
+          auroraLayerEl.innerHTML = `
+            <div class="aurora-wrap">
+              <div class="aurora-layer aurora-green"  style="--rot:-8deg"></div>
+              <div class="aurora-layer aurora-blue"   style="--rot:-5deg"></div>
+              <div class="aurora-layer aurora-purple" style="--rot:-10deg"></div>
+              <div class="aurora-ribbon"></div>
+            </div>`;
+        }
+        auroraLayerEl.style.display = '';
+        auroraLayerEl.style.opacity = auroraActive ? '1' : '0';
+        auroraLayerEl.style.transition = 'opacity 3s ease';
+        auroraLayerEl.style.pointerEvents = 'none';
       }
     }
 
@@ -2802,7 +3342,7 @@ _clearDroplets() {
         </div>` : ''}
       `;
     }
-    console.log('[start] _startCanvas called, cond:', cond, 'isNight:', isNight);
+    // removed start log
     this._startCanvas(cond, isNight, attrs);
     // v2: update modal rows on every render (modal DOM persists in _buildShell)
     this._updateForecastModal(modalForecast, moonPhase, modalForecastType);
@@ -2815,9 +3355,55 @@ _clearDroplets() {
         const closeBtn = modal?.querySelector('.fc-modal-close');
         if (closeBtn) closeBtn.addEventListener('click', e => {
           e.stopPropagation();
-          backdrop?.classList.remove('open');
-          modal?.classList.remove('open');
+          this._closeForecastModal('light');
         });
+        if (backdrop) backdrop.addEventListener('click', e => {
+          e.stopPropagation();
+          if (e.target === backdrop) this._closeForecastModal('light');
+        });
+        if (modal) {
+          let swipe = null;
+          modal.addEventListener('click', e => e.stopPropagation());
+          modal.addEventListener('keydown', e => {
+            if (e.key === 'Escape' && this._isForecastModalOpen()) {
+              e.stopPropagation();
+              this._closeForecastModal('light');
+            }
+          });
+          modal.addEventListener('pointerdown', e => {
+            if (!this._isForecastModalOpen()) return;
+            if (e.target?.closest?.('.fc-modal-close')) return;
+            const fromHandle = !!e.target?.closest?.('.fc-modal-handle,.fc-modal-header');
+            if (!fromHandle) return;
+            e.preventDefault();
+            e.stopPropagation();
+            try { modal.setPointerCapture?.(e.pointerId); } catch(err) {}
+            swipe = { x: e.clientX, y: e.clientY, fromHandle };
+          });
+          modal.addEventListener('pointermove', e => {
+            if (!swipe) return;
+            e.preventDefault();
+            e.stopPropagation();
+          }, { passive: false });
+          modal.addEventListener('pointerup', e => {
+            if (!swipe) return;
+            const dx = e.clientX - swipe.x;
+            const dy = e.clientY - swipe.y;
+            const shouldClose = dy > 56 && Math.abs(dx) < 90;
+            swipe = null;
+            try { modal.releasePointerCapture?.(e.pointerId); } catch(err) {}
+            if (shouldClose) {
+              e.stopPropagation();
+              this._closeForecastModal('light');
+            }
+          });
+          modal.addEventListener('pointercancel', e => {
+            if (swipe) {
+              try { modal.releasePointerCapture?.(e.pointerId); } catch(err) {}
+            }
+            swipe = null;
+          });
+        }
       }, 100);
     }
     // Re-attach expand button handler (ct innerHTML rebuilt each render)
@@ -2829,8 +3415,7 @@ _clearDroplets() {
         btn._nimbusHandled = true;
         btn.addEventListener('click', e => {
           e.stopPropagation();
-          backdrop.classList.add('open');
-          modal.classList.add('open');
+          this._openForecastModal(btn);
         });
       }
     }, 50);
