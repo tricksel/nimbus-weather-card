@@ -4377,7 +4377,7 @@ _clearDroplets() {
         return (h % 12 || 12) + (h < 12 ? 'am' : 'pm');
       }
     }
-    const locMap = {'en':'en-US','es':'es-ES','de':'de-DE'};
+    const locMap = {'en':'en-US','es':'es-ES','de':'de-DE','nl':'nl-NL'};
     const loc = locMap[this._config?.language||'en'] || 'en-US';
     return d.toLocaleDateString(loc, { weekday: 'short' }).toUpperCase();
   }
@@ -5015,7 +5015,7 @@ _clearDroplets() {
 
   _clockParts(use24h = this._config?.use_24h !== false) {
     const now = new Date();
-    const locMap = {'en':'en-US','es':'es-ES','de':'de-DE'};
+    const locMap = {'en':'en-US','es':'es-ES','de':'de-DE','nl':'nl-NL'};
     const loc = locMap[this._config?.language||'en'] || 'en-US';
     const h = now.getHours();
     const m = String(now.getMinutes()).padStart(2,'0');
